@@ -61,17 +61,72 @@ from generative.inferers import LatentDiffusionInferer
 from generative.losses import PatchAdversarialLoss, PerceptualLoss
 from generative.networks.nets import AutoencoderKL, DiffusionModelUNet, PatchDiscriminator
 from generative.networks.schedulers import DDPMScheduler
+
 import logging
+import wandb
+from src.util import load_wand_credentials, visualize_3d_image_slice_wise
+
+# Specify a MONAI_DATA_DIRECTORY variable, where the data will be downloaded. If not specified a temporary directory will be used.
+directory = os.environ.get("MONAI_DATA_DIRECTORY")
+output_directory = os.environ.get("MONAI_OUTPUT_DIRECTORY")
+
+WANDB_LOG_IMAGES = os.environ.get("WANDB_LOG_IMAGES")
+WANDB_RUN_NAME = os.environ.get("WANDB_RUN_NAME")
 
 logging.basicConfig(format="%(asctime)s %(levelname)-8s %(message)s", level=logging.INFO, datefmt="%Y-%m-%d %H:%M:%S")
 
-from util import load_wand_credentials
+run_config={"batch_size": 2,
+            "input_image_downsampling_factors": (2.4, 2.4, 2.2),
+            "input_image_crop_roi": (96, 96, 64),
+            }
+
+auto_encoder_config= {
+    "spatial_dims":3,
+    "in_channels":1,
+    "out_channels":1,
+    "num_channels":(32, 64, 64),
+    "latent_channels":3,
+    "num_res_blocks":1,
+    "norm_num_groups":16,
+    "attention_levels":(False, False, True),
+}
+
+patch_discrim_config= {
+    "spatial_dims":3, 
+    "num_layers_d":3, 
+    "num_channels":32, 
+    "in_channels":1, 
+    "out_channels":1
+}
+
+auto_encoder_training_config= {
+    "n_epochs" : 100,
+    "autoencoder_warm_up_n_epochs" : 5,
+}
+
+diffusion_model_unet_config = {
+    "spatial_dims":3,
+    "in_channels":3,
+    "out_channels":3,
+    "num_res_blocks":1,
+    "num_channels":(32, 64, 64),
+    "attention_levels":(False, True, True),
+    "num_head_channels":(0, 64, 64),
+}
+
+diffusion_model_training_config = {
+    "n_epochs" : 150,
+}
 
 project, entity = load_wand_credentials()
-
-import wandb
-
-wandb.init(project=project, entity=entity)
+wandb.init(project=project, entity=entity, name=WANDB_RUN_NAME, 
+           config={"run_config": run_config,
+                   "auto_encoder_config": auto_encoder_config, 
+                   "patch_discrim_config": patch_discrim_config,
+                   "auto_encoder_training_config": auto_encoder_training_config,
+                   "diffusion_model_unet_config": diffusion_model_unet_config,
+                   "diffusion_model_training_config": diffusion_model_training_config,
+                   })
 
 
 print_config()
@@ -81,10 +136,6 @@ print_config()
 set_determinism(42)
 
 # ### Setup a data directory and download dataset
-# Specify a MONAI_DATA_DIRECTORY variable, where the data will be downloaded. If not specified a temporary directory will be used.
-
-directory = os.environ.get("MONAI_DATA_DIRECTORY")
-output_directory = os.environ.get("MONAI_OUTPUT_DIRECTORY")
 root_dir = tempfile.mkdtemp() if directory is None else directory
 logging.info(root_dir)
 
@@ -92,7 +143,6 @@ logging.info(root_dir)
 # Here we will download the Brats dataset using MONAI's `DecathlonDataset` class, and we prepare the data loader for the training set.
 
 # +
-batch_size = 2
 channel = 0  # 0 = Flair
 assert channel in [0, 1, 2, 3], "Choose a valid channel"
 
@@ -104,8 +154,8 @@ train_transforms = transforms.Compose(
         transforms.EnsureChannelFirstd(keys=["image"], channel_dim="no_channel"),
         transforms.EnsureTyped(keys=["image"]),
         transforms.Orientationd(keys=["image"], axcodes="RAS"),
-        transforms.Spacingd(keys=["image"], pixdim=(2.4, 2.4, 2.2), mode=("bilinear")),
-        transforms.CenterSpatialCropd(keys=["image"], roi_size=(96, 96, 64)),
+        transforms.Spacingd(keys=["image"], pixdim=run_config["input_image_downsampling_factors"], mode=("bilinear")),
+        transforms.CenterSpatialCropd(keys=["image"], roi_size=run_config["input_image_crop_roi"]),
         transforms.ScaleIntensityRangePercentilesd(keys="image", lower=0, upper=99.5, b_min=0, b_max=1),
     ]
 )
@@ -120,7 +170,7 @@ train_ds = DecathlonDataset(
     progress=False,
     transform=train_transforms,
 )
-train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=8, persistent_workers=True)
+train_loader = DataLoader(train_ds, batch_size=run_config["batch_size"], shuffle=True, num_workers=8, persistent_workers=True)
 logging.info(f'Image shape {train_ds[0]["image"].shape}')
 # -
 
@@ -130,23 +180,8 @@ logging.info(f'Image shape {train_ds[0]["image"].shape}')
 # Plot axial, coronal and sagittal slices of a training sample
 check_data = first(train_loader)
 sample_index = 0
-# Plot axial, coronal and sagittal slices of a training sample
-def visualize_3d_image_slice_wise(img, path):
-    fig, axs = plt.subplots(nrows=1, ncols=3)
-    for ax in axs:
-        ax.axis("off")
-    ax = axs[0]
-    ax.imshow(img[..., img.shape[2] // 2], cmap="gray")
-    ax = axs[1]
-    ax.imshow(img[:, img.shape[1] // 2, ...], cmap="gray")
-    ax = axs[2]
-    ax.imshow(img[img.shape[0] // 2, ...], cmap="gray")
-    plt.savefig(os.path.join(output_directory, path))
-    plt.cla()
-
-
-img = check_data["image"][sample_index, channel]
-visualize_3d_image_slice_wise(img, "training_examples.png")
+img = check_data["image"][sample_index, channel].detach().cpu().numpy()
+visualize_3d_image_slice_wise(img, os.path.join(output_directory, "training_examples.png"), "training example", WANDB_LOG_IMAGES)
 
 # -
 
@@ -162,19 +197,12 @@ logging.info(f"Using {device}")
 
 # +
 autoencoder = AutoencoderKL(
-    spatial_dims=3,
-    in_channels=1,
-    out_channels=1,
-    num_channels=(32, 64, 64),
-    latent_channels=3,
-    num_res_blocks=1,
-    norm_num_groups=16,
-    attention_levels=(False, False, True),
+    **auto_encoder_config
 )
 autoencoder.to(device)
 
 
-discriminator = PatchDiscriminator(spatial_dims=3, num_layers_d=3, num_channels=32, in_channels=1, out_channels=1)
+discriminator = PatchDiscriminator(**patch_discrim_config)
 discriminator.to(device)
 # -
 
@@ -205,8 +233,8 @@ optimizer_d = torch.optim.Adam(params=discriminator.parameters(), lr=1e-4)
 # ### Train model
 
 # +
-n_epochs = 100
-autoencoder_warm_up_n_epochs = 5
+n_epochs = auto_encoder_training_config["n_epochs"]
+autoencoder_warm_up_n_epochs = auto_encoder_training_config["autoencoder_warm_up_n_epochs"]
 val_interval = 10
 epoch_recon_loss_list = []
 epoch_gen_loss_list = []
@@ -303,7 +331,7 @@ plt.clf()
 # ### Visualise reconstructions
 
 img = reconstruction[sample_index, channel].detach().cpu().numpy()
-visualize_3d_image_slice_wise(img, "Visualize_Reconstruction.png")
+visualize_3d_image_slice_wise(img, os.path.join(output_directory, "Visualize_Reconstruction.png"), "Visualize Reconstruction", WANDB_LOG_IMAGES)
 
 
 # ## Diffusion Model
@@ -314,13 +342,7 @@ visualize_3d_image_slice_wise(img, "Visualize_Reconstruction.png")
 
 # +
 unet = DiffusionModelUNet(
-    spatial_dims=3,
-    in_channels=3,
-    out_channels=3,
-    num_res_blocks=1,
-    num_channels=(32, 64, 64),
-    attention_levels=(False, True, True),
-    num_head_channels=(0, 64, 64),
+    **diffusion_model_unet_config
 )
 unet.to(device)
 
@@ -353,7 +375,7 @@ optimizer_diff = torch.optim.Adam(params=unet.parameters(), lr=1e-4)
 # ### Train diffusion model
 
 # +
-n_epochs = 150
+n_epochs = diffusion_model_training_config["n_epochs"]
 epoch_loss_list = []
 autoencoder.eval()
 scaler = GradScaler()
@@ -428,7 +450,7 @@ synthetic_images = inferer.sample(
 # ### Visualise synthetic data
 
 img = synthetic_images[sample_index, channel].detach().cpu().numpy()  # images
-visualize_3d_image_slice_wise(img, "SyntheticImages.png")
+visualize_3d_image_slice_wise(img,  os.path.join(output_directory, "SyntheticImages.png"), "Synthetic Images", WANDB_LOG_IMAGES)
 
 # ## Clean-up data
 
