@@ -64,11 +64,13 @@ from generative.networks.schedulers import DDPMScheduler
 
 import logging
 import wandb
-from src.util import load_wand_credentials, visualize_3d_image_slice_wise
+from src.util import load_wand_credentials, visualize_3d_image_slice_wise, Stopwatch, save_model_as_artifact
 
 # Specify a MONAI_DATA_DIRECTORY variable, where the data will be downloaded. If not specified a temporary directory will be used.
-directory = os.environ.get("MONAI_DATA_DIRECTORY")
-output_directory = os.environ.get("MONAI_OUTPUT_DIRECTORY")
+directory = os.environ.get("DATA_DIRECTORY")
+base_directory = os.environ.get("BASE_DIRECTORY")
+output_directory = os.environ.get("OUTPUT_DIRECTORY")
+model_directory = os.environ.get("MODEL_DIRECTORY")
 
 WANDB_LOG_IMAGES = os.environ.get("WANDB_LOG_IMAGES")
 WANDB_RUN_NAME = os.environ.get("WANDB_RUN_NAME")
@@ -119,7 +121,7 @@ diffusion_model_training_config = {
 }
 
 project, entity = load_wand_credentials()
-wandb.init(project=project, entity=entity, name=WANDB_RUN_NAME, 
+wandb_run = wandb.init(project=project, entity=entity, name=WANDB_RUN_NAME, 
            config={"run_config": run_config,
                    "auto_encoder_config": auto_encoder_config, 
                    "patch_discrim_config": patch_discrim_config,
@@ -128,6 +130,9 @@ wandb.init(project=project, entity=entity, name=WANDB_RUN_NAME,
                    "diffusion_model_training_config": diffusion_model_training_config,
                    })
 
+autoencoder = AutoencoderKL(
+    **auto_encoder_config
+)
 
 print_config()
 # -
@@ -159,6 +164,8 @@ train_transforms = transforms.Compose(
         transforms.ScaleIntensityRangePercentilesd(keys="image", lower=0, upper=99.5, b_min=0, b_max=1),
     ]
 )
+dataset_preparation_stopwatch = Stopwatch("Dataset preparation took: ").start()
+
 train_ds = DecathlonDataset(
     root_dir=root_dir,
     task="Task01_BrainTumour",
@@ -171,6 +178,8 @@ train_ds = DecathlonDataset(
     transform=train_transforms,
 )
 train_loader = DataLoader(train_ds, batch_size=run_config["batch_size"], shuffle=True, num_workers=8, persistent_workers=True)
+
+dataset_preparation_stopwatch.stop().display()
 logging.info(f'Image shape {train_ds[0]["image"].shape}')
 # -
 
@@ -243,6 +252,9 @@ val_recon_epoch_loss_list = []
 intermediary_images = []
 n_example_images = 4
 
+wandb.define_metric("autoencoder/epoch")
+wandb.define_metric("autoencoder/*", step_metric="autoencoder/epoch")
+autoencoder_stopwatch = Stopwatch("Autoencoder training time: ").start()
 for epoch in range(n_epochs):
     autoencoder.train()
     discriminator.train()
@@ -290,10 +302,10 @@ for epoch in range(n_epochs):
             disc_epoch_loss += discriminator_loss.item()
 
     logging.info(f"{epoch} | recons_loss={epoch_loss / (step + 1):.5f}, gen_loss={gen_epoch_loss / (step + 1):.5f},  disc_loss={disc_epoch_loss / (step + 1):.5f}")
-    wandb.log({ "epoch": epoch, 
-                "recons_loss": epoch_loss / (step + 1),
-                "gen_loss": gen_epoch_loss / (step + 1),
-                "disc_loss": disc_epoch_loss / (step + 1), 
+    wandb.log({ "autoencoder/epoch": epoch, 
+                "autoencoder/recons_loss": epoch_loss / (step + 1),
+                "autoencoder/gen_loss": gen_epoch_loss / (step + 1),
+                "autoencoder/disc_loss": disc_epoch_loss / (step + 1), 
               })
     epoch_recon_loss_list.append(epoch_loss / (step + 1))
     epoch_gen_loss_list.append(gen_epoch_loss / (step + 1))
@@ -303,6 +315,10 @@ del discriminator
 del loss_perceptual
 torch.cuda.empty_cache()
 # -
+
+autoencoder_stopwatch.stop().display()
+save_model_as_artifact(wandb_run, autoencoder, "autoencoderKL", auto_encoder_config, model_directory)
+
 
 plt.style.use("ggplot")
 plt.title("Learning Curves", fontsize=20)
@@ -383,6 +399,7 @@ scaler = GradScaler()
 first_batch = first(train_loader)
 z = autoencoder.encode_stage_2_inputs(first_batch["image"].to(device))
 
+diffusion_stopwatch = Stopwatch("Diffusion training took:").start()
 for epoch in range(n_epochs):
     unet.train()
     epoch_loss = 0
@@ -414,11 +431,16 @@ for epoch in range(n_epochs):
         epoch_loss += loss.item()
 
     logging.info(f"{epoch}: loss={epoch_loss / (step + 1):.5f}")
-    wandb.log({ "epoch_diffusion": epoch, 
-                "diffusion_loss": epoch_loss / (step + 1),
+    wandb.define_metric("diffusion/epoch")
+    wandb.define_metric("diffusion/*", step_metric="diffusion/epoch")
+    wandb.log({ "diffusion/epoch": epoch,
+                "diffusion/loss": epoch_loss / (step + 1),
               })
     epoch_loss_list.append(epoch_loss / (step + 1))
 # -
+
+diffusion_stopwatch.stop().display()
+save_model_as_artifact(wandb_run, unet, "DiffusionModelUNet", diffusion_model_unet_config, model_directory)
 
 plt.plot(epoch_loss_list)
 plt.title("Learning Curves", fontsize=20)
@@ -453,6 +475,8 @@ img = synthetic_images[sample_index, channel].detach().cpu().numpy()  # images
 visualize_3d_image_slice_wise(img,  os.path.join(output_directory, "SyntheticImages.png"), "Synthetic Images", WANDB_LOG_IMAGES)
 
 # ## Clean-up data
+
+wandb.finish()
 
 if directory is None:
     shutil.rmtree(root_dir)
