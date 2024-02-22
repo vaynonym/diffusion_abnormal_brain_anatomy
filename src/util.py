@@ -35,23 +35,25 @@ def load_model(model: torch.nn.Module, path: str, optimizer: torch.optim.Optimiz
     if optimizer is not None:
         optimizer.load_state_dict(state["optimizer"])
 
+# setting path to None means no graph will be created and only images logged
 def visualize_3d_image_slice_wise(img: MetaTensor, path, description_prefix="", log_to_wandb=False):
     axial = img[..., img.shape[2] // 2]
     coronal = img[:, img.shape[1] // 2, ...]
     sagittal = img[img.shape[0] // 2, ...]
 
-    fig, axs = plt.subplots(nrows=1, ncols=3)
-    for ax in axs:
-        ax.axis("off")
-    ax = axs[0]
-    ax.imshow(axial, cmap="gray")
-    ax = axs[1]
-    ax.imshow(coronal, cmap="gray")
-    ax = axs[2]
-    ax.imshow(sagittal, cmap="gray")
-    plt.savefig(path)
-    plt.cla()
-    plt.clf()
+    if path:
+        fig, axs = plt.subplots(nrows=1, ncols=3)
+        for ax in axs:
+            ax.axis("off")
+        ax = axs[0]
+        ax.imshow(axial, cmap="gray")
+        ax = axs[1]
+        ax.imshow(coronal, cmap="gray")
+        ax = axs[2]
+        ax.imshow(sagittal, cmap="gray")
+        plt.savefig(path)
+        plt.cla()
+        plt.clf()
 
     def normalize(x):
         return (x - np.min(x)) / (np.max(x) - np.min(x))
