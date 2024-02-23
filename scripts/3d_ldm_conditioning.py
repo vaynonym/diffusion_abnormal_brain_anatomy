@@ -54,30 +54,30 @@ from monai.config import print_config
 from monai.data import DataLoader
 from monai.utils import first, set_determinism
 from torch.cuda.amp import GradScaler, autocast
-from torch.nn import L1Loss
 from tqdm import tqdm
 from monai.data.dataset import CacheDataset
 
 from generative.inferers import LatentDiffusionInferer
-from generative.losses import PatchAdversarialLoss, PerceptualLoss
 from generative.networks.nets import AutoencoderKL, DiffusionModelUNet, PatchDiscriminator
 from generative.networks.schedulers import DDPMScheduler
 
-import logging
 import wandb
 import numpy as np
-from src.util import load_wand_credentials, visualize_3d_image_slice_wise, Stopwatch, save_model_as_artifact
+from src.util import load_wand_credentials, visualize_3d_image_slice_wise, Stopwatch, device
+from src.model_util import save_model_as_artifact, load_model_from_run_with_matching_config
+from src.training import train_autoencoder
+from src.logging_util import LOGGER
+import random
+
 
 # Specify a MONAI_DATA_DIRECTORY variable, where the data will be downloaded. If not specified a temporary directory will be used.
-directory = os.environ.get("DATA_DIRECTORY")
+data_directory = os.environ.get("DATA_DIRECTORY")
 base_directory = os.environ.get("BASE_DIRECTORY")
 output_directory = os.environ.get("OUTPUT_DIRECTORY")
 model_directory = os.environ.get("MODEL_DIRECTORY")
 
 WANDB_LOG_IMAGES = os.environ.get("WANDB_LOG_IMAGES")
 WANDB_RUN_NAME = os.environ.get("WANDB_RUN_NAME")
-
-logging.basicConfig(format="%(asctime)s %(levelname)-8s %(message)s", level=logging.INFO, datefmt="%Y-%m-%d %H:%M:%S")
 
 run_config={"batch_size": 2,
             "input_image_downsampling_factors": (2.4, 2.4, 2.2),
@@ -132,7 +132,7 @@ for image_dim in run_config["input_image_crop_roi"]:
     assert (image_dim % (down_sample_factor_autoencoder * down_sample_factor_diffusion_model)) == 0,\
            f"image dim {image_dim} must be evenly divisible by autoencoder downsampling factor {down_sample_factor_autoencoder} * diffusion dowmsampling factor {down_sample_factor_diffusion_model}"
 
-logging.info("Image dimensions match downsampling factors! Good to go!")
+LOGGER.info("Image dimensions match downsampling factors! Good to go!")
 
 project, entity = load_wand_credentials()
 wandb_run = wandb.init(project=project, entity=entity, name=WANDB_RUN_NAME, 
@@ -148,32 +148,24 @@ autoencoder = AutoencoderKL(
     **auto_encoder_config
 )
 
-print_config()
-# -
-
 # for reproducibility purposes set a seed
 set_determinism(42)
 
 # ### Setup a data directory and download dataset
-root_dir = tempfile.mkdtemp() if directory is None else directory
-logging.info(root_dir)
 
 # ### Prepare data loader for the training set
 # Here we will download the Brats dataset using MONAI's `DecathlonDataset` class, and we prepare the data loader for the training set.
 
-# +
-channels = [0, 1]  # 0 = Flair
+
+#	 "0": "FLAIR", 
+#	 "1": "T1w", 
+#	 "2": "t1gd",
+#	 "3": "T2w"
+channels = [0, 1]
 for channel in channels:
     assert channel in [0, 1, 2, 3], "Choose a valid channel"
+LOGGER.info(f"Using channels {channels}")
 
-load_transforms = transforms.Compose(
-    [
-        transforms.LoadImaged(keys=["image"]),
-        transforms.EnsureChannelFirstd(keys=["image"]),
-    ]
-)
-
-import random
 def select_random_channel_and_set_class(input_dict):
     selected_channel = random.choice(channels)
     input_dict["image"] = input_dict["image"][selected_channel, :, :, :]
@@ -197,15 +189,17 @@ train_transforms = transforms.Compose(
         ),
     ]
 )
-dataset_preparation_stopwatch = Stopwatch("Dataset preparation took: ").start()
+
+LOGGER.info("Loading dataset...")
+dataset_preparation_stopwatch = Stopwatch("Done! Loading the Dataset took: ").start()
 
 train_ds = DecathlonDataset(
-    root_dir=root_dir,
+    root_dir=data_directory,
     task="Task01_BrainTumour",
     section="training",  # validation
     cache_rate=1.0,  # you may need a few Gb of RAM... Set to 0 otherwise
     num_workers=6,
-    download=not os.path.exists(os.path.join(root_dir, "Task01_BrainTumour")),  # Set download to True if the dataset hasnt been downloaded yet
+    download=not os.path.exists(os.path.join(data_directory, "Task01_BrainTumour")),  # Set download to True if the dataset hasnt been downloaded yet
     seed=0,
     progress=False,
     transform=train_transforms,
@@ -215,12 +209,12 @@ train_loader = DataLoader(train_ds, batch_size=run_config["batch_size"], shuffle
 print("train_loader length:", len(train_loader))
 
 dataset_preparation_stopwatch.stop().display()
-logging.info(f'Image shape {train_ds[0]["image"].shape}')
+LOGGER.info(f'Image shape {train_ds[0]["image"].shape}')
 
 down_sampling_factor = (2 ** (len(auto_encoder_config["num_channels"]) -1) )
 dim_xyz = tuple(map(lambda x: x // down_sampling_factor, run_config["input_image_crop_roi"]))
 encoding_shape = (1, auto_encoder_config["latent_channels"], dim_xyz[0], dim_xyz[1], dim_xyz[2])
-logging.info(f"Encoding shape: {encoding_shape}")
+LOGGER.info(f"Encoding shape: {encoding_shape}")
 # -
 
 # ### Visualise examples from the training set
@@ -243,158 +237,39 @@ for i in range(10):
 # In this section, we will define an autoencoder with KL-regularization for the LDM. The autoencoder's primary purpose is to transform input images into a latent representation that the diffusion model will subsequently learn. By doing so, we can decrease the computational resources required to train the diffusion component, making this approach suitable for learning high-resolution medical images.
 #
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-logging.info(f"Using {device}")
 
-# +
 autoencoder = AutoencoderKL(
     **auto_encoder_config
 )
 autoencoder.to(device)
 
+# Trz to load identically trained autoencoder if it already exists. Else train a new one.
+if not load_model_from_run_with_matching_config([auto_encoder_config, auto_encoder_training_config, run_config],
+                                            ["auto_encoder_config", "auto_encoder_training_config", "run_config"],
+                                            project=project, entity=entity, 
+                                            model=autoencoder, artifact_name="autoencoderKL",
+                                            models_path=model_directory,
+                                            ):
+    LOGGER.info("Training new autoencoder...")
+    autoencoder = train_autoencoder(autoencoder, train_loader, 
+                                                    patch_discrim_config, auto_encoder_training_config, run_config,
+                                                    WANDB_LOG_IMAGES)
 
-discriminator = PatchDiscriminator(**patch_discrim_config)
-discriminator.to(device)
-# -
+    save_model_as_artifact(wandb_run, autoencoder, type(autoencoder).__name__, auto_encoder_config, model_directory)
+else:
+    LOGGER.info("Loaded existing autoencoder")
 
-# ### Defining Losses
-#
-# We will also specify the perceptual and adversarial losses, including the involved networks, and the optimizers to use during the training process.
-
-# +
-l1_loss = L1Loss()
-adv_loss = PatchAdversarialLoss(criterion="least_squares")
-loss_perceptual = PerceptualLoss(spatial_dims=3, network_type="squeeze", is_fake_3d=True, fake_3d_ratio=0.2)
-loss_perceptual.to(device)
-
-
-def KL_loss(z_mu, z_sigma):
-    kl_loss = 0.5 * torch.sum(z_mu.pow(2) + z_sigma.pow(2) - torch.log(z_sigma.pow(2)) - 1, dim=[1, 2, 3, 4])
-    return torch.sum(kl_loss) / kl_loss.shape[0]
-
-
-adv_weight = 0.01
-perceptual_weight = 0.001
-kl_weight = 1e-6
-# -
-
-optimizer_g = torch.optim.Adam(params=autoencoder.parameters(), lr=1e-4)
-optimizer_d = torch.optim.Adam(params=discriminator.parameters(), lr=1e-4)
-
-# ### Train model
-
-# +
-n_epochs = auto_encoder_training_config["n_epochs"]
-autoencoder_warm_up_n_epochs = auto_encoder_training_config["autoencoder_warm_up_n_epochs"]
-val_interval = 10
-epoch_recon_loss_list = []
-epoch_gen_loss_list = []
-epoch_disc_loss_list = []
-val_recon_epoch_loss_list = []
-intermediary_images = []
-n_example_images = 4
-
-wandb.define_metric("autoencoder/epoch")
-wandb.define_metric("autoencoder/*", step_metric="autoencoder/epoch")
-autoencoder_stopwatch = Stopwatch("Autoencoder training time: ").start()
-for epoch in range(n_epochs):
-    autoencoder.train()
-    discriminator.train()
-    epoch_loss = 0
-    gen_epoch_loss = 0
-    disc_epoch_loss = 0
-
-    for step, batch in enumerate(train_loader):
-        images = batch["image"].to(device)  # choose only one of Brats channels
-
-        # Generator part
-        optimizer_g.zero_grad(set_to_none=True)
-        reconstruction, z_mu, z_sigma = autoencoder(images)
-        kl_loss = KL_loss(z_mu, z_sigma)
-
-        recons_loss = l1_loss(reconstruction.float(), images.float())
-        p_loss = loss_perceptual(reconstruction.float(), images.float())
-        loss_g = recons_loss + kl_weight * kl_loss + perceptual_weight * p_loss
-
-        if epoch > autoencoder_warm_up_n_epochs:
-            logits_fake = discriminator(reconstruction.contiguous().float())[-1]
-            generator_loss = adv_loss(logits_fake, target_is_real=True, for_discriminator=False)
-            loss_g += adv_weight * generator_loss
-
-        loss_g.backward()
-        optimizer_g.step()
-
-        if epoch > autoencoder_warm_up_n_epochs:
-            # Discriminator part
-            optimizer_d.zero_grad(set_to_none=True)
-            logits_fake = discriminator(reconstruction.contiguous().detach())[-1]
-            loss_d_fake = adv_loss(logits_fake, target_is_real=False, for_discriminator=True)
-            logits_real = discriminator(images.contiguous().detach())[-1]
-            loss_d_real = adv_loss(logits_real, target_is_real=True, for_discriminator=True)
-            discriminator_loss = (loss_d_fake + loss_d_real) * 0.5
-
-            loss_d = adv_weight * discriminator_loss
-
-            loss_d.backward()
-            optimizer_d.step()
-
-        epoch_loss += recons_loss.item()
-        if epoch > autoencoder_warm_up_n_epochs:
-            gen_epoch_loss += generator_loss.item()
-            disc_epoch_loss += discriminator_loss.item()
-
-    logging.info(f"{epoch} | recons_loss={epoch_loss / (step + 1):.5f}, gen_loss={gen_epoch_loss / (step + 1):.5f},  disc_loss={disc_epoch_loss / (step + 1):.5f}")
-    wandb.log({ "autoencoder/epoch": epoch, 
-                "autoencoder/recons_loss": epoch_loss / (step + 1),
-                "autoencoder/gen_loss": gen_epoch_loss / (step + 1),
-                "autoencoder/disc_loss": disc_epoch_loss / (step + 1), 
-              })
-    epoch_recon_loss_list.append(epoch_loss / (step + 1))
-    epoch_gen_loss_list.append(gen_epoch_loss / (step + 1))
-    epoch_disc_loss_list.append(disc_epoch_loss / (step + 1))
-
-    if epoch + 1 in (np.round(np.arange(0.0, 1.01, run_config["gen_image_intervall"]) * n_epochs)):
-        img = reconstruction[sample_index, 0].detach().cpu().numpy()
-        visualize_3d_image_slice_wise(img, None, "Visualize Reconstruction (training)", WANDB_LOG_IMAGES)
-
-
-del discriminator
-del loss_perceptual
-torch.cuda.empty_cache()
-# -
-
-autoencoder_stopwatch.stop().display()
-save_model_as_artifact(wandb_run, autoencoder, "autoencoderKL", auto_encoder_config, model_directory)
-
-
-plt.style.use("ggplot")
-plt.title("Learning Curves", fontsize=20)
-plt.plot(epoch_recon_loss_list)
-plt.yticks(fontsize=12)
-plt.xticks(fontsize=12)
-plt.xlabel("Epochs", fontsize=16)
-plt.ylabel("Loss", fontsize=16)
-plt.legend(prop={"size": 14})
-plt.savefig(os.path.join(output_directory, "Learning_Curves.png"))
-plt.clf()
-
-
-plt.title("Adversarial Training Curves", fontsize=20)
-plt.plot(epoch_gen_loss_list, color="C0", linewidth=2.0, label="Generator")
-plt.plot(epoch_disc_loss_list, color="C1", linewidth=2.0, label="Discriminator")
-plt.yticks(fontsize=12)
-plt.xticks(fontsize=12)
-plt.xlabel("Epochs", fontsize=16)
-plt.ylabel("Loss", fontsize=16)
-plt.legend(prop={"size": 14})
-plt.savefig(os.path.join(output_directory, "Adverserial_Training_Curves.png"))
-plt.clf()
+for i in range(10):
+    _, batch = next(enumerate(train_loader))
+    images = batch["image"].to(device)
+    autoencoder.eval()
+    reconstruction, _, _ = autoencoder(images) 
+    img = reconstruction[sample_index, 0].detach().cpu().numpy()
+    visualize_3d_image_slice_wise(img, os.path.join(output_directory, "Visualize_Reconstruction.png"), "Visualize Reconstruction", WANDB_LOG_IMAGES)
 
 
 # ### Visualise reconstructions
 
-img = reconstruction[sample_index, 0].detach().cpu().numpy()
-visualize_3d_image_slice_wise(img, os.path.join(output_directory, "Visualize_Reconstruction.png"), "Visualize Reconstruction", WANDB_LOG_IMAGES)
 
 
 # ## Diffusion Model
@@ -425,7 +300,7 @@ with torch.no_grad():
     with autocast(enabled=True):
         z = autoencoder.encode_stage_2_inputs(check_data["image"].to(device))
 
-logging.info(f"Scaling factor set to {1/torch.std(z)}")
+LOGGER.info(f"Scaling factor set to {1/torch.std(z)}")
 scale_factor = 1 / torch.std(z)
 # -
 
@@ -501,7 +376,7 @@ for epoch in range(n_epochs):
 
         epoch_loss += loss.item()
 
-    logging.info(f"{epoch}: loss={epoch_loss / (step + 1):.5f}")
+    LOGGER.info(f"{epoch}: loss={epoch_loss / (step + 1):.5f}")
     wandb.log({ "diffusion/epoch": epoch,
                 "diffusion/loss": epoch_loss / (step + 1),
               })
@@ -512,18 +387,7 @@ for epoch in range(n_epochs):
 # -
 
 diffusion_stopwatch.stop().display()
-save_model_as_artifact(wandb_run, unet, "DiffusionModelUNet", diffusion_model_unet_config, model_directory)
-
-plt.plot(epoch_loss_list)
-plt.title("Learning Curves", fontsize=20)
-plt.plot(epoch_loss_list)
-plt.yticks(fontsize=12)
-plt.xticks(fontsize=12)
-plt.xlabel("Epochs", fontsize=16)
-plt.ylabel("Loss", fontsize=16)
-plt.legend(prop={"size": 14})
-plt.savefig(os.path.join(output_directory, "Diffusion_Learning_Curves.png"))
-plt.clf()
+save_model_as_artifact(wandb_run, unet, type(unet).__name__, diffusion_model_unet_config, model_directory)
 
 # ### Plotting sampling example
 #
@@ -535,6 +399,3 @@ for i in range(10):
 # ## Clean-up data
 
 wandb.finish()
-
-if directory is None:
-    shutil.rmtree(root_dir)

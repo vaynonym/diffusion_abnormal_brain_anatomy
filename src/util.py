@@ -7,33 +7,16 @@ import os.path
 from monai.data.meta_tensor import MetaTensor
 import time
 from datetime import timedelta
+from src.logging_util import LOGGER
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+LOGGER.info(f"Using {device}")
 
 def load_wand_credentials():
     with open("./local_config.yml") as file:
         local_user_config = yaml.safe_load(file)
     
     return local_user_config["project"], local_user_config["entity"]
-
-def save_model(model: torch.nn.Module, path: str, optimizer: torch.optim.Optimizer=None):
-
-    state = {"model": model.state_dict()}
-    if optimizer is not None:
-        state["optimizer"] = optimizer.state_dict()
-    torch.save(state, path)
-
-def save_model_as_artifact(wandb_run, model: torch.nn.Module, model_name: str, model_config: dict, path:str):
-    model_artifact = wandb.Artifact(model_name, type="model", metadata=dict(model_config))
-    file_path = os.path.join(path, model_name + ".pth")
-    save_model(model, file_path)
-    model_artifact.add_file(file_path)
-    wandb_run.log_artifact(model_artifact)
-
-def load_model(model: torch.nn.Module, path: str, optimizer: torch.optim.Optimizer=None):
-    state = torch.load(path)
-    model.load_state_dict(state["model"])
-
-    if optimizer is not None:
-        optimizer.load_state_dict(state["optimizer"])
 
 # setting path to None means no graph will be created and only images logged
 def visualize_3d_image_slice_wise(img: MetaTensor, path, description_prefix="", log_to_wandb=False):
@@ -79,10 +62,10 @@ class Stopwatch():
     
     def display(self, log_to_wandb=False):
         if self.start_time is None or self.end_time is None:
-            print("Warning: Incorrect use of Stopwatch! Need to start and stop before displaying!")
+            LOGGER.warn("Warning: Incorrect use of Stopwatch! Need to start and stop before displaying!")
             return self
         timedelta_string = "{}".format(timedelta(seconds=self.end_time - self.start_time))
-        print(self.prefix_string + timedelta_string)
+        LOGGER.info(self.prefix_string + timedelta_string)
         
         if log_to_wandb:
             wandb.log({self.prefix_string: timedelta_string})
@@ -90,3 +73,12 @@ class Stopwatch():
         self.start_time = None
         self.end_time = None
         return self
+
+# Intended to be used as a decorator abstraction for stopwatch applied to function calls
+def measure_time(prefix_string: str):
+    def inner(func):
+        stopwatch = Stopwatch(prefix_string)
+        stopwatch.start()
+        func()
+        stopwatch.stop().display()
+    return inner
