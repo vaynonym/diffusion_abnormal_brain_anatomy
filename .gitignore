@@ -1,0 +1,15 @@
+output**
+logs**
+data**
+vanilla_results**
+wandb**
+build**
+models**
+
+notes.mad
+
+
+__pycache__**
+**egg-info
+**.egg
+
