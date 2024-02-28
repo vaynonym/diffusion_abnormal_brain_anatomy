@@ -20,35 +20,60 @@ def load_wand_credentials():
     
     return local_user_config["project"], local_user_config["entity"]
 
+def normalize(x):
+    return (x - np.min(x)) / (np.max(x) - np.min(x))
+
 # setting path to None means no graph will be created and only images logged
-def visualize_3d_image_slice_wise(img: MetaTensor, path, description_prefix="", log_to_wandb=False):
+def log_image_to_wandb(img: MetaTensor, reconstruction: MetaTensor = None, description_prefix="", log_to_wandb=False, conditioning_information=None):
+    if conditioning_information:
+        conditioning_information = round(conditioning_information.item(), 2)
+
     axial = img[..., img.shape[2] // 2]
     coronal = img[:, img.shape[1] // 2, ...]
     sagittal = img[img.shape[0] // 2, ...]
 
-    if path:
-        fig, axs = plt.subplots(nrows=1, ncols=3)
-        for ax in axs:
-            ax.axis("off")
-        ax = axs[0]
-        ax.imshow(axial, cmap="gray")
-        ax = axs[1]
-        ax.imshow(coronal, cmap="gray")
-        ax = axs[2]
-        ax.imshow(sagittal, cmap="gray")
-        plt.savefig(path)
-        plt.cla()
-        plt.clf()
+    if log_to_wandb:
+        # expects images in 0-1 range if floats
+        wandb_images = [ wandb.Image(normalize(img), mode="L", caption=f"{caption} (c={conditioning_information})") for img, caption in zip([axial, coronal, sagittal], ["Axial", "Coronal", "Sagittal"])]
+        if reconstruction is not None:
+            axial_reconstruction = reconstruction[..., reconstruction.shape[2] // 2]
+            coronal_reconstruction = reconstruction[:, reconstruction.shape[1] // 2, ...]
+            sagittal_reconstruction = reconstruction[reconstruction.shape[0] // 2, ...]
+            wandb_images_reconstruction = [ wandb.Image(normalize(img), mode="L", caption=f"{caption} (reconstruction)") 
+                            for img, caption in zip([axial_reconstruction, coronal_reconstruction, sagittal_reconstruction], ["Axial", "Coronal", "Sagittal"])]
+            wandb_images = [wandb_images, wandb_images_reconstruction]
+        # suppress warning "Images sizes do not match. This will causes images to be display incorrectly in the UI" as it's not actually a problem
+        with all_logging_disabled():
+            wandb.log({f"{description_prefix}": wandb_images}) 
 
-    def normalize(x):
-        return (x - np.min(x)) / (np.max(x) - np.min(x))
+# setting path to None means no graph will be created and only images logged
+def visualize_3d_image_slice_wise(img: MetaTensor, path, description_prefix="", log_to_wandb=False, conditioning_information=None):
+    axial = img[..., img.shape[2] // 2]
+    coronal = img[:, img.shape[1] // 2, ...]
+    sagittal = img[img.shape[0] // 2, ...]
+
+    fig, axs = plt.subplots(nrows=1, ncols=3, figsize=(16, 4), constrained_layout=False)
+
+    fig.suptitle(f"N. Ventricle Volume: {round(conditioning_information.item(), 3)}")
+    for ax in axs:
+        ax.axis("off")
+    ax = axs[0]
+    ax.imshow(axial, cmap="gray")
+    ax = axs[1]
+    ax.imshow(coronal, cmap="gray")
+    ax = axs[2]
+    ax.imshow(sagittal, cmap="gray")
+    if path:
+        plt.savefig(path)
 
     if log_to_wandb:
         # expects images in 0-1 range if floats
-        wandb_images = [ wandb.Image(normalize(img), mode="L", caption=caption) for img, caption in zip([axial, coronal, sagittal], ["Axial", "Coronal", "Sagittal"])]
         # suppress warning "Images sizes do not match. This will causes images to be display incorrectly in the UI" as it's not actually a problem
         with all_logging_disabled():
-            wandb.log({description_prefix: wandb_images}) 
+            wandb.log({description_prefix: plt}) 
+    
+    plt.cla()
+    plt.clf()
 
 class Stopwatch():
     def __init__(self, prefix_string: str):

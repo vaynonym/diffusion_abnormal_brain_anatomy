@@ -65,3 +65,13 @@ def load_model_from_run_with_matching_config(subconfigs, subconfig_names, projec
     os.remove(downloaded_file_path)
 
     return model
+
+def check_dimensions(run_config, auto_encoder_config, diffusion_model_unet_config):
+    # Check that the image dimensions match downsampling dimensions
+    for image_dim in run_config["input_image_crop_roi"]:
+        down_sample_factor_autoencoder = len(auto_encoder_config["num_channels"]) - 1
+        down_sample_factor_diffusion_model = len(diffusion_model_unet_config["num_channels"]) - 1
+        assert (image_dim % (down_sample_factor_autoencoder * down_sample_factor_diffusion_model)) == 0,\
+            f"image dim {image_dim} must be evenly divisible by autoencoder downsampling factor {down_sample_factor_autoencoder} * diffusion dowmsampling factor {down_sample_factor_diffusion_model}"
+
+    LOGGER.info("Image dimensions match downsampling factors! Good to go!")

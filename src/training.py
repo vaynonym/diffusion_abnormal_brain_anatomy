@@ -7,7 +7,7 @@ from torch.nn import L1Loss
 from generative.losses import PatchAdversarialLoss, PerceptualLoss
 from generative.networks.nets import AutoencoderKL, DiffusionModelUNet, PatchDiscriminator
 
-from src.util import device, Stopwatch, visualize_3d_image_slice_wise
+from src.util import device, Stopwatch, log_image_to_wandb
 from src.logging_util import LOGGER
 
 def train_autoencoder(autoencoder: AutoencoderKL, train_loader: DataLoader, patch_discrim_config: dict, auto_encoder_training_config: dict, run_config: dict, WANDB_LOG_IMAGES: bool):
@@ -103,8 +103,11 @@ def train_autoencoder(autoencoder: AutoencoderKL, train_loader: DataLoader, patc
                 })
 
         if epoch + 1 in (np.round(np.arange(0.0, 1.01, run_config["gen_image_intervall"]) * n_epochs)):
-            img = reconstruction[0, 0].detach().cpu().numpy()
-            visualize_3d_image_slice_wise(img, None, "Visualize Reconstruction (training)", WANDB_LOG_IMAGES)
+            with torch.no_grad():
+                images = batch["image"][0, 0].detach().cpu().numpy()
+                autoencoder.eval()
+                r_img = reconstruction[0, 0].detach().cpu().numpy()
+                log_image_to_wandb(images, r_img, "Visualize Reconstruction", WANDB_LOG_IMAGES, conditioning_information=batch["volume"][0].detach().cpu())
 
 
     del discriminator
