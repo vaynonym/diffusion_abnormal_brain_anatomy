@@ -2,12 +2,14 @@ import yaml
 import torch
 import matplotlib.pyplot as plt
 import wandb
+import warnings
 import numpy as np
-import os.path
 from monai.data.meta_tensor import MetaTensor
 import time
 from datetime import timedelta
-from src.logging_util import LOGGER
+from src.logging_util import LOGGER, all_logging_disabled
+import yaml
+from pathlib import Path
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 LOGGER.info(f"Using {device}")
@@ -44,13 +46,22 @@ def visualize_3d_image_slice_wise(img: MetaTensor, path, description_prefix="", 
     if log_to_wandb:
         # expects images in 0-1 range if floats
         wandb_images = [ wandb.Image(normalize(img), mode="L", caption=caption) for img, caption in zip([axial, coronal, sagittal], ["Axial", "Coronal", "Sagittal"])]
-        wandb.log({description_prefix: wandb_images}) 
+        # suppress warning "Images sizes do not match. This will causes images to be display incorrectly in the UI" as it's not actually a problem
+        with all_logging_disabled():
+            wandb.log({description_prefix: wandb_images}) 
 
 class Stopwatch():
     def __init__(self, prefix_string: str):
         self.prefix_string = prefix_string
         self.start_time = None
         self.end_time = None
+
+    def __enter__(self):
+        self.start()
+        return self
+    
+    def __exit__(self):
+        self.stop().display()
     
     def start(self):
         self.start_time = time.monotonic()
@@ -82,3 +93,6 @@ def measure_time(prefix_string: str):
         func()
         stopwatch.stop().display()
     return inner
+
+def read_config(path: str):
+    return yaml.safe_load(Path(path).read_text())
