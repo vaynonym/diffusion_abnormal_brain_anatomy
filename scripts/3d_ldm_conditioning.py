@@ -63,8 +63,8 @@ from generative.networks.schedulers import DDPMScheduler
 
 import wandb
 import numpy as np
-from src.util import load_wand_credentials, visualize_3d_image_slice_wise, Stopwatch, device
-from src.model_util import save_model_as_artifact, load_model_from_run_with_matching_config
+from src.util import load_wand_credentials, visualize_3d_image_slice_wise, Stopwatch, device, read_config
+from src.model_util import save_model_as_artifact, load_model_from_run_with_matching_config, check_dimensions
 from src.training import train_autoencoder
 from src.logging_util import LOGGER
 import random
@@ -79,60 +79,15 @@ model_directory = os.environ.get("MODEL_DIRECTORY")
 WANDB_LOG_IMAGES = os.environ.get("WANDB_LOG_IMAGES")
 WANDB_RUN_NAME = os.environ.get("WANDB_RUN_NAME")
 
-run_config={"batch_size": 2,
-            "input_image_downsampling_factors": (2.4, 2.4, 2.2),
-            "input_image_crop_roi": (96, 96, 64),
-            "gen_image_intervall": 0.2,
-            }
+experiment_config = read_config(os.environ.get("EXPERIMENT_CONFIG"))
+run_config = experiment_config["run"]
+auto_encoder_config = experiment_config["auto_encoder"]
+patch_discrim_config = experiment_config["patch_discrim"]
+auto_encoder_training_config = experiment_config["autoencoder_training"]
+diffusion_model_unet_config = experiment_config["diffusion_model_unet"]
+diffusion_model_training_config = experiment_config["diffusion_model_unet_training"]
 
-auto_encoder_config= {
-    "spatial_dims":3,
-    "in_channels":1,
-    "out_channels":1,
-    "latent_channels":3,
-    "num_channels":(32, 64, 64),
-    "num_res_blocks":1,
-    "norm_num_groups":16,
-    "attention_levels":(False, False, True),
-}
-
-patch_discrim_config= {
-    "spatial_dims":3, 
-    "num_layers_d":3, 
-    "num_channels":32, 
-    "in_channels":1, 
-    "out_channels":1
-}
-
-auto_encoder_training_config= {
-    "n_epochs": 100,
-    "autoencoder_warm_up_n_epochs": 5,
-}
-
-diffusion_model_unet_config = {
-    "spatial_dims":3,
-    "in_channels":3,
-    "out_channels":3,
-    "num_res_blocks":1,
-    "num_channels":(32, 64, 64),
-    "attention_levels":(False, True, True),
-    "num_head_channels":(0, 64, 64),
-    "with_conditioning":True,
-    "cross_attention_dim":1,
-}
-
-diffusion_model_training_config = {
-    "n_epochs" : 150,
-}
-
-# Check that the image dimensions match downsampling dimensions
-for image_dim in run_config["input_image_crop_roi"]:
-    down_sample_factor_autoencoder = len(auto_encoder_config["num_channels"]) - 1
-    down_sample_factor_diffusion_model = len(diffusion_model_unet_config["num_channels"]) - 1
-    assert (image_dim % (down_sample_factor_autoencoder * down_sample_factor_diffusion_model)) == 0,\
-           f"image dim {image_dim} must be evenly divisible by autoencoder downsampling factor {down_sample_factor_autoencoder} * diffusion dowmsampling factor {down_sample_factor_diffusion_model}"
-
-LOGGER.info("Image dimensions match downsampling factors! Good to go!")
+check_dimensions(run_config, auto_encoder_config, diffusion_model_unet_config)
 
 project, entity = load_wand_credentials()
 wandb_run = wandb.init(project=project, entity=entity, name=WANDB_RUN_NAME, 
@@ -221,12 +176,13 @@ LOGGER.info(f"Encoding shape: {encoding_shape}")
 
 # +
 # Plot axial, coronal and sagittal slices of a training sample
-iter_loader = iter(train_loader)
+iterator = enumerate(train_loader)
+sample_data = None # reused later
 for i in range(10):
-    check_data = next(iter_loader)
+    _, sample_data = next(iterator)
     sample_index = 0
-    img = check_data["image"][sample_index, 0].detach().cpu().numpy()
-    visualize_3d_image_slice_wise(img, None, "trainingdata sample/c=" + str(check_data["class"][sample_index, 0].item()), WANDB_LOG_IMAGES)
+    img = sample_data["image"][sample_index, 0].detach().cpu().numpy()
+    visualize_3d_image_slice_wise(img, None, "trainingdata sample/c=" + str(sample_data["class"][sample_index, 0].item()), WANDB_LOG_IMAGES)
 
 # -
 
@@ -243,7 +199,7 @@ autoencoder = AutoencoderKL(
 )
 autoencoder.to(device)
 
-# Trz to load identically trained autoencoder if it already exists. Else train a new one.
+# Try to load identically trained autoencoder if it already exists. Else train a new one.
 if not load_model_from_run_with_matching_config([auto_encoder_config, auto_encoder_training_config, run_config],
                                             ["auto_encoder_config", "auto_encoder_training_config", "run_config"],
                                             project=project, entity=entity, 
@@ -259,16 +215,14 @@ if not load_model_from_run_with_matching_config([auto_encoder_config, auto_encod
 else:
     LOGGER.info("Loaded existing autoencoder")
 
+# ### Visualise reconstructions
 for i in range(10):
     _, batch = next(enumerate(train_loader))
     images = batch["image"].to(device)
     autoencoder.eval()
     reconstruction, _, _ = autoencoder(images) 
     img = reconstruction[sample_index, 0].detach().cpu().numpy()
-    visualize_3d_image_slice_wise(img, os.path.join(output_directory, "Visualize_Reconstruction.png"), "Visualize Reconstruction", WANDB_LOG_IMAGES)
-
-
-# ### Visualise reconstructions
+    visualize_3d_image_slice_wise(img, None, "Visualize Reconstruction", WANDB_LOG_IMAGES)
 
 
 
@@ -298,7 +252,7 @@ scheduler = DDPMScheduler(num_train_timesteps=1000, schedule="scaled_linear_beta
 # +
 with torch.no_grad():
     with autocast(enabled=True):
-        z = autoencoder.encode_stage_2_inputs(check_data["image"].to(device))
+        z = autoencoder.encode_stage_2_inputs(sample_data["image"].to(device))
 
 LOGGER.info(f"Scaling factor set to {1/torch.std(z)}")
 scale_factor = 1 / torch.std(z)
@@ -329,20 +283,32 @@ wandb.define_metric("diffusion/*", step_metric="diffusion/epoch")
 def eval_generate_sample_images(inferer: LatentDiffusionInferer, autoencoder, unet, scheduler, path, prefix_string):
     autoencoder.eval()
     unet.eval()
-    noise = torch.randn( encoding_shape)
+
+    guidance_scale = 7.0
+    noise = torch.randn(encoding_shape)
     noise = noise.to(device)
-    c = torch.ones(1, 1, 1).float() * random.choice(channels + [-1])
-    c = c.to(device)
+    for c in channels:
+        conditioning = torch.cat([-1 * torch.ones(1, 1, 1).float(), c * torch.ones(1, 1, 1).float()], dim=0).to(device)
 
-    scheduler.set_timesteps(num_inference_steps=1000)
-    synthetic_images = inferer.sample(
-        input_noise=noise, autoencoder_model=autoencoder, diffusion_model=unet, scheduler=scheduler, conditioning=c
-    )
 
-    # ### Visualise synthetic data
+        scheduler.set_timesteps(num_inference_steps=1000)
+        for t in scheduler.timesteps:
+            with autocast(enabled=True):
+                with torch.no_grad():
+                    noise_input = torch.cat([noise] * 2)
+                    model_output = unet(noise_input, timesteps=torch.Tensor((t,)).to(noise.device), context=conditioning)
+                    noise_pred_uncond, noise_pred_text = model_output.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-    img = synthetic_images[sample_index, 0].detach().cpu().numpy()  # images
-    visualize_3d_image_slice_wise(img, path, prefix_string + f"/c={c.item()}", WANDB_LOG_IMAGES)
+            noise, _ = scheduler.step(noise_pred, t, noise)
+
+        decode = autoencoder.decode_stage_2_outputs
+        image = decode(noise / scale_factor)
+
+        # ### Visualise synthetic data
+
+        img = image[sample_index, 0].detach().cpu().numpy()  # images
+        visualize_3d_image_slice_wise(img, path, prefix_string + f"/c={c}", WANDB_LOG_IMAGES)
 
 diffusion_stopwatch = Stopwatch("Diffusion training took:").start()
 for epoch in range(n_epochs):
@@ -393,7 +359,7 @@ save_model_as_artifact(wandb_run, unet, type(unet).__name__, diffusion_model_une
 #
 # Finally, we generate an image with our LDM. For that, we will initialize a latent representation with just noise. Then, we will use the `unet` to perform 1000 denoising steps. In the last step, we decode the latent representation and plot the sampled image.
 
-for i in range(10):
+for i in range(5):
     eval_generate_sample_images(inferer, autoencoder, unet, scheduler, None, "Synthetic Images")
 
 # ## Clean-up data
