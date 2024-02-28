@@ -1,0 +1,4 @@
+batch_size: 2
+input_image_downsampling_factors: (2.4, 2.4, 2.2)
+input_image_crop_roi: (96, 96, 64)
+gen_image_intervall: 0.2
