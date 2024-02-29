@@ -1,6 +1,6 @@
 output**
 logs**
-data**
+data/**
 vanilla_results**
 wandb**
 build**

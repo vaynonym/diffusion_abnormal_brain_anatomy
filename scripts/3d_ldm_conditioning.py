@@ -63,7 +63,7 @@ from generative.networks.schedulers import DDPMScheduler
 
 import wandb
 import numpy as np
-from src.util import load_wand_credentials, visualize_3d_image_slice_wise, Stopwatch, device, read_config
+from src.util import load_wand_credentials, visualize_3d_image_slice_wise, Stopwatch, device, read_config, visualize_reconstructions
 from src.model_util import save_model_as_artifact, load_model_from_run_with_matching_config, check_dimensions
 from src.training import train_autoencoder
 from src.logging_util import LOGGER
@@ -207,7 +207,7 @@ if not load_model_from_run_with_matching_config([auto_encoder_config, auto_encod
                                             models_path=model_directory,
                                             ):
     LOGGER.info("Training new autoencoder...")
-    autoencoder = train_autoencoder(autoencoder, train_loader, 
+    autoencoder = train_autoencoder(autoencoder, train_loader, None,
                                                     patch_discrim_config, auto_encoder_training_config, run_config,
                                                     WANDB_LOG_IMAGES)
 
@@ -215,14 +215,7 @@ if not load_model_from_run_with_matching_config([auto_encoder_config, auto_encod
 else:
     LOGGER.info("Loaded existing autoencoder")
 
-# ### Visualise reconstructions
-for i in range(10):
-    _, batch = next(enumerate(train_loader))
-    images = batch["image"].to(device)
-    autoencoder.eval()
-    reconstruction, _, _ = autoencoder(images) 
-    img = reconstruction[sample_index, 0].detach().cpu().numpy()
-    visualize_3d_image_slice_wise(img, None, "Visualize Reconstruction", WANDB_LOG_IMAGES)
+visualize_reconstructions(train_loader, autoencoder, 10)
 
 
 

@@ -12,7 +12,7 @@ import yaml
 from pathlib import Path
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-LOGGER.info(f"Using {device}")
+LOGGER.info(f"Using {torch.cuda.get_device_name(device) if torch.cuda.is_available() else "cpu"}")
 
 def load_wand_credentials():
     with open("./local_config.yml") as file:
@@ -31,20 +31,54 @@ def log_image_to_wandb(img: MetaTensor, reconstruction: MetaTensor = None, descr
     axial = img[..., img.shape[2] // 2]
     coronal = img[:, img.shape[1] // 2, ...]
     sagittal = img[img.shape[0] // 2, ...]
+    multiplier = 2 if reconstruction is not None else 1
+    fig, axs = plt.subplots(nrows=1, ncols=3 * multiplier, figsize=(12 *multiplier, 4), constrained_layout=False)
+
+    fig.suptitle(f"N. Ventricle Volume: {conditioning_information}", fontweight="bold")
+
+    for ax in axs:
+        ax.axis("off")
+    ax = axs[0 * multiplier]
+    ax.imshow(axial, cmap="gray")
+    ax = axs[1 * multiplier]
+    ax.imshow(coronal, cmap="gray")
+    ax = axs[2 * multiplier]
+    ax.imshow(sagittal, cmap="gray")
+    if reconstruction is not None:
+        axial_r = reconstruction[..., reconstruction.shape[2] // 2]
+        coronal_r = reconstruction[:, reconstruction.shape[1] // 2, ...]
+        sagittal_r = reconstruction[reconstruction.shape[0] // 2, ...]
+        ax = axs[0 * multiplier + 1]
+        ax.imshow(axial_r, cmap="gray")
+        ax = axs[1 * multiplier + 1]
+        ax.imshow(coronal_r, cmap="gray")
+        ax = axs[2 * multiplier + 1]
+        ax.imshow(sagittal_r, cmap="gray")
+
+    plt.subplots_adjust(wspace=0.2, hspace=0)
 
     if log_to_wandb:
         # expects images in 0-1 range if floats
-        wandb_images = [ wandb.Image(normalize(img), mode="L", caption=f"{caption} (c={conditioning_information})") for img, caption in zip([axial, coronal, sagittal], ["Axial", "Coronal", "Sagittal"])]
-        if reconstruction is not None:
-            axial_reconstruction = reconstruction[..., reconstruction.shape[2] // 2]
-            coronal_reconstruction = reconstruction[:, reconstruction.shape[1] // 2, ...]
-            sagittal_reconstruction = reconstruction[reconstruction.shape[0] // 2, ...]
-            wandb_images_reconstruction = [ wandb.Image(normalize(img), mode="L", caption=f"{caption} (reconstruction)") 
-                            for img, caption in zip([axial_reconstruction, coronal_reconstruction, sagittal_reconstruction], ["Axial", "Coronal", "Sagittal"])]
-            wandb_images = [wandb_images, wandb_images_reconstruction]
         # suppress warning "Images sizes do not match. This will causes images to be display incorrectly in the UI" as it's not actually a problem
         with all_logging_disabled():
-            wandb.log({f"{description_prefix}": wandb_images}) 
+            wandb.log({description_prefix: plt}) 
+    
+    plt.cla()
+    plt.clf()
+
+def visualize_reconstructions(train_loader, autoencoder, num_examples):
+    # ### Visualise reconstructions
+    autoencoder.eval()
+    with torch.no_grad():
+        for i, batch in enumerate(train_loader):
+            images = batch["image"].to(device)
+            reconstructions, _, _ = autoencoder(images) 
+            r_img = reconstructions[0, 0].detach().cpu().numpy()
+            img = images[0, 0].detach().cpu().numpy()
+            log_image_to_wandb(img, r_img, "Visualize Reconstruction", True)
+            
+            if i+1 >= num_examples:
+                break
 
 # setting path to None means no graph will be created and only images logged
 def visualize_3d_image_slice_wise(img: MetaTensor, path, description_prefix="", log_to_wandb=False, conditioning_information=None):
@@ -85,7 +119,7 @@ class Stopwatch():
         self.start()
         return self
     
-    def __exit__(self):
+    def __exit__(self, exc_type, exc_value, traceback):
         self.stop().display()
     
     def start(self):
