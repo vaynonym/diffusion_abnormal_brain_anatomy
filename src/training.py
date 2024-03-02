@@ -9,8 +9,8 @@ from generative.networks.nets import AutoencoderKL, DiffusionModelUNet, PatchDis
 
 from src.util import device, Stopwatch, log_image_to_wandb
 from src.logging_util import LOGGER
+from src.evaluation import evaluate_autoencoder 
 
-from generative.metrics import FIDMetric, MMDMetric, MultiScaleSSIMMetric, SSIMMetric
 
 def train_autoencoder(autoencoder: AutoencoderKL, train_loader: DataLoader, val_loader: DataLoader, patch_discrim_config: dict, auto_encoder_training_config: dict, run_config: dict, WANDB_LOG_IMAGES: bool):
     train_stopwatch = Stopwatch("Autoencoder training time: ").start()
@@ -108,10 +108,11 @@ def train_autoencoder(autoencoder: AutoencoderKL, train_loader: DataLoader, val_
             images = batch["image"][0, 0].detach().cpu().numpy()
             autoencoder.eval()
             r_img = reconstruction[0, 0].detach().cpu().numpy()
-            log_image_to_wandb(images, r_img, "Visualize Reconstruction", WANDB_LOG_IMAGES, conditioning_information=batch["volume"][0].detach().cpu())
+            wandb.log({"autoencoder/max_r_intensity": r_img.max(), "autoencoder/min_r_intensity": r_img.min()})
+            log_image_to_wandb(images, r_img, "training/reconstruction", WANDB_LOG_IMAGES, conditioning_information=batch["volume"][0].detach().cpu())
             if val_loader is not None:
                 with Stopwatch("Validation took: "):
-                    validation(val_loader, autoencoder)
+                    evaluate_autoencoder(val_loader, autoencoder)
 
 
     # clean up data
@@ -123,32 +124,3 @@ def train_autoencoder(autoencoder: AutoencoderKL, train_loader: DataLoader, val_
     train_stopwatch.stop().display()
 
     return autoencoder
-
-
-def validation(val_loader, autoencoder):
-    metrics = { 
-        "MS-SSIM": MultiScaleSSIMMetric(spatial_dims=3, data_range=1.0, kernel_size=4),
-        "SSIM":SSIMMetric(spatial_dims=3, data_range=1.0, kernel_size=4),
-        "MMD":MMDMetric(),
-    }
-    
-    accumulations = [[] for _ in metrics.keys()]
-
-
-    for _, batch in enumerate(val_loader):
-        image = batch["image"].to(device)
-
-        with torch.no_grad():
-            image_recon = autoencoder.reconstruct(image)
-
-            for metric, accumulator in zip(metrics.values(), accumulations):
-                accumulator.append(metric(image, image_recon))
-
-    with torch.no_grad():
-        wandb.log(
-            {
-                f"autoencoder/{name}": (torch.stack(accumulator).mean().item()) for (name, accumulator) in zip(metrics.keys(), accumulations)
-            }
-        )
-    
-    return None

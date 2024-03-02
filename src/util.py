@@ -12,7 +12,7 @@ import yaml
 from pathlib import Path
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-LOGGER.info(f"Using {torch.cuda.get_device_name(device) if torch.cuda.is_available() else "cpu"}")
+LOGGER.info(f"Using {torch.cuda.get_device_name(device) if torch.cuda.is_available() else 'cpu'}")
 
 def load_wand_credentials():
     with open("./local_config.yml") as file:
@@ -27,6 +27,8 @@ def normalize(x):
 def log_image_to_wandb(img: MetaTensor, reconstruction: MetaTensor = None, description_prefix="", log_to_wandb=False, conditioning_information=None):
     if conditioning_information:
         conditioning_information = round(conditioning_information.item(), 2)
+    
+    img = torch.clamp(img, 0., 1.)
 
     axial = img[..., img.shape[2] // 2]
     coronal = img[:, img.shape[1] // 2, ...]
@@ -45,6 +47,7 @@ def log_image_to_wandb(img: MetaTensor, reconstruction: MetaTensor = None, descr
     ax = axs[2 * multiplier]
     ax.imshow(sagittal, cmap="gray")
     if reconstruction is not None:
+        reconstruction = torch.clamp(reconstruction, 0., 1.)
         axial_r = reconstruction[..., reconstruction.shape[2] // 2]
         coronal_r = reconstruction[:, reconstruction.shape[1] // 2, ...]
         sagittal_r = reconstruction[reconstruction.shape[0] // 2, ...]
@@ -75,7 +78,7 @@ def visualize_reconstructions(train_loader, autoencoder, num_examples):
             reconstructions, _, _ = autoencoder(images) 
             r_img = reconstructions[0, 0].detach().cpu().numpy()
             img = images[0, 0].detach().cpu().numpy()
-            log_image_to_wandb(img, r_img, "Visualize Reconstruction", True)
+            log_image_to_wandb(img, r_img, "Reconstructions", True)
             
             if i+1 >= num_examples:
                 break

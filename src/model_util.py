@@ -28,7 +28,7 @@ def load_model_from_run_with_matching_config(subconfigs, subconfig_names, projec
     
     filters = {
         "$and": [{f"config.{subconfig_name}": subconfig} for subconfig, subconfig_name in zip(subconfigs, subconfig_names)]
-              + [{"state": "finished"}],
+            #  + [{"state": "finished"}],
     }
     runs = wandb.Api().runs(path=f"{entity}/{project}", filters=filters)
 
