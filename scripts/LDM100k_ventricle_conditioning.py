@@ -18,10 +18,11 @@ import numpy as np
 
 from src.util import load_wand_credentials, log_image_to_wandb, Stopwatch, device, read_config, visualize_reconstructions
 from src.model_util import save_model_as_artifact, load_model_from_run_with_matching_config, check_dimensions
-from src.training import train_autoencoder
+from src.training import train_autoencoder, train_diffusion_model
 from src.logging_util import LOGGER
 from src.datasets import SyntheticLDM100K
-from src.evaluation import evaluate_diffusion_model
+from src.diffusion import get_scale_factor, generate_and_log_sample_images
+from src.directory_management import DATA_DIRECTORY
 
 import torch.multiprocessing
 
@@ -30,12 +31,6 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 LOGGER.info(f"Device count: {torch.cuda.device_count()}", )
 LOGGER.info(f"Device: {device}")
 
-# read out directories
-data_directory = os.environ.get("DATA_DIRECTORY")
-base_directory = os.environ.get("BASE_DIRECTORY")
-output_directory = os.environ.get("OUTPUT_DIRECTORY")
-model_directory = os.environ.get("MODEL_DIRECTORY")
-pretrained_model_directory = os.environ.get("PRETRAINED_MODEL_DIRECTORY")
 
 WANDB_LOG_IMAGES = os.environ.get("WANDB_LOG_IMAGES")
 WANDB_RUN_NAME = os.environ.get("WANDB_RUN_NAME")
@@ -60,13 +55,8 @@ wandb_run = wandb.init(project=project, entity=entity, name=WANDB_RUN_NAME,
                    "diffusion_model_training_config": diffusion_model_training_config,
                    })
 
-autoencoder = AutoencoderKL(
-    **auto_encoder_config
-)
-
 # for reproducibility purposes set a seed
 set_determinism(42)
-
 
 def peek_shape(x):
     LOGGER.info(x.shape)
@@ -86,11 +76,9 @@ train_transforms = transforms.Compose(
         #transforms.Lambdad(keys="image", func=peek_shape),
         #transforms.Lambdad(keys="volume", func=peek),
         transforms.EnsureTyped(keys=["image"]),
-        #transforms.Orientationd(keys=["image"], axcodes="RAS"),
-        transforms.Orientationd(keys=["image"], axcodes="IPL"),
+        transforms.Orientationd(keys=["image"], axcodes="IPL"), # axcodes="RAS"
         transforms.Spacingd(keys=["image"], pixdim=run_config["input_image_downsampling_factors"], mode=("bilinear")),
         transforms.CenterSpatialCropd(keys=["image"], roi_size=run_config["input_image_crop_roi"]),
-        #transforms.ScaleIntensityd(keys=["image"], minv=0.0, maxv=1.0),
         transforms.ScaleIntensityRangePercentilesd(keys="image", lower=0.5, upper=99.5, b_min=0, b_max=1),
         transforms.Lambdad(keys=["volume"], func = lambda x: torch.tensor(x, dtype=torch.float32).unsqueeze(0).unsqueeze(0)),
     ]
@@ -99,10 +87,10 @@ train_transforms = transforms.Compose(
 LOGGER.info("Loading dataset...")
 dataset_preparation_stopwatch = Stopwatch("Done! Loading the Dataset took: ").start()
 
-dataset_size = 4000
+dataset_size = run_config["dataset_size"]
 
 train_ds = SyntheticLDM100K(
-    dataset_path=os.path.join(data_directory, "LDM_100k"),
+    dataset_path=os.path.join(DATA_DIRECTORY, "LDM_100k"),
     section="training",
     size=dataset_size,
     cache_rate=1.0,  # you may need a few Gb of RAM... Set to 0 otherwise
@@ -112,7 +100,7 @@ train_ds = SyntheticLDM100K(
 )
 
 validation_ds = SyntheticLDM100K(
-    dataset_path=os.path.join(data_directory, "LDM_100k"),
+    dataset_path=os.path.join(DATA_DIRECTORY, "LDM_100k"),
     section="validation",  # validation
     size=dataset_size,
     cache_rate=1.0,  # you may need a few Gb of RAM... Set to 0 otherwise
@@ -122,26 +110,21 @@ validation_ds = SyntheticLDM100K(
 )
 
 
-train_loader = DataLoader(train_ds, batch_size=run_config["batch_size"], shuffle=True, num_workers=2, drop_last=True, persistent_workers=True)
-valid_loader = DataLoader(validation_ds, batch_size=run_config["batch_size"], shuffle=True, num_workers=2, drop_last=True, persistent_workers=True)
+train_loader = DataLoader(train_ds, batch_size=run_config["batch_size"], shuffle=True, num_workers=4, drop_last=True, persistent_workers=True)
+valid_loader = DataLoader(validation_ds, batch_size=run_config["batch_size"], shuffle=True, num_workers=6, drop_last=True, persistent_workers=True)
+
+dataset_preparation_stopwatch.stop().display()
 
 LOGGER.info(f"Train length: {len(train_ds)} in {len(train_loader)} batches")
 LOGGER.info(f"Valid length: {len(validation_ds)} in {len(valid_loader)} batches")
-
-
-dataset_preparation_stopwatch.stop().display()
 LOGGER.info(f'Image shape {train_ds[0]["image"].shape}')
 
 down_sampling_factor = (2 ** (len(auto_encoder_config["num_channels"]) -1) )
 dim_xyz = tuple(map(lambda x: x // down_sampling_factor, run_config["input_image_crop_roi"]))
 encoding_shape = (run_config["batch_size"], auto_encoder_config["latent_channels"], dim_xyz[0], dim_xyz[1], dim_xyz[2])
 LOGGER.info(f"Encoding shape: {encoding_shape}")
-# -
 
 # ### Visualise examples from the training set
-
-# +
-# Plot axial, coronal and sagittal slices of a training sample
 iterator = enumerate(train_loader)
 sample_data = None # reused later
 for i in range(3):
@@ -152,177 +135,59 @@ for i in range(3):
 
 LOGGER.info(f"Batch image shape: {sample_data['image'].shape}")
 
-# -
-
-# ## Autoencoder KL
-#
-# ### Define Autoencoder KL network
-#
-# In this section, we will define an autoencoder with KL-regularization for the LDM. The autoencoder's primary purpose is to transform input images into a latent representation that the diffusion model will subsequently learn. By doing so, we can decrease the computational resources required to train the diffusion component, making this approach suitable for learning high-resolution medical images.
-#
-
-
-autoencoder = AutoencoderKL(
-    **auto_encoder_config
-)
-autoencoder.to(device)
-
+autoencoder = AutoencoderKL(**auto_encoder_config).to(device)
 
 # Try to load identically trained autoencoder if it already exists. Else train a new one.
 if not load_model_from_run_with_matching_config([auto_encoder_config, auto_encoder_training_config],
                                             ["auto_encoder_config", "auto_encoder_training_config"],
                                             project=project, entity=entity, 
                                             model=autoencoder, artifact_name=AutoencoderKL.__name__,
-                                            models_path=model_directory,
                                             ):
     LOGGER.info("Training new autoencoder...")
     autoencoder = train_autoencoder(autoencoder, train_loader, valid_loader,
-                                                    patch_discrim_config, auto_encoder_training_config, run_config,
+                                                    patch_discrim_config, auto_encoder_training_config, run_config["evaluation_intervall"],
                                                     WANDB_LOG_IMAGES)
 
-    save_model_as_artifact(wandb_run, autoencoder, type(autoencoder).__name__, auto_encoder_config, model_directory)
+    save_model_as_artifact(wandb_run, autoencoder, type(autoencoder).__name__, auto_encoder_config)
 else:
     LOGGER.info("Loaded existing autoencoder")
 
 visualize_reconstructions(train_loader, autoencoder, 10)
 
 
-# ## Diffusion Model
-#
-# ### Define diffusion model and scheduler
-#
-# In this section, we will define the diffusion model that will learn data distribution of the latent representation of the autoencoder. Together with the diffusion model, we define a beta scheduler responsible for defining the amount of noise tahat is added across the diffusion's model Markov chain.
-
-# +
-unet = DiffusionModelUNet(
-    **diffusion_model_unet_config
-)
-unet.to(device)
-
-
-scheduler = DDPMScheduler(num_train_timesteps=1000, schedule="scaled_linear_beta", beta_start=0.0015, beta_end=0.0195)
-# -
-
-# ### Scaling factor
-#
-# As mentioned in Rombach et al. [1] Section 4.3.2 and D.1, the signal-to-noise ratio (induced by the scale of the latent space) can affect the results obtained with the LDM, if the standard deviation of the latent space distribution drifts too much from that of a Gaussian. For this reason, it is best practice to use a scaling factor to adapt this standard deviation.
-#
-# _Note: In case where the latent space is close to a Gaussian distribution, the scaling factor will be close to one, and the results will not differ from those obtained when it is not used._
-#
-
-# +
-with torch.no_grad():
-    with autocast(enabled=True):
-        z = autoencoder.encode_stage_2_inputs(sample_data["image"].to(device))
-
-scale_factor = 1 / torch.std(z)
-LOGGER.info(f"Scaling factor set to {scale_factor}")
-# -
+unet = DiffusionModelUNet(**diffusion_model_unet_config).to(device)
+scheduler = DDPMScheduler(num_train_timesteps=1000, schedule="scaled_linear_beta", beta_start=0.0015, beta_end=0.0205, clip_sample=False)
 
 # We define the inferer using the scale factor:
-
+scale_factor = get_scale_factor(autoencoder=autoencoder, sample_data=sample_data["image"].to(device))
 inferer = LatentDiffusionInferer(scheduler, scale_factor=scale_factor)
 
-optimizer_diff = torch.optim.Adam(params=unet.parameters(), lr=1e-4)
-
-# ### Train diffusion model
-
-# +
-n_epochs = diffusion_model_training_config["n_epochs"]
-epoch_loss_list = []
-autoencoder.eval()
+optimizer_diff = torch.optim.Adam(params=unet.parameters(), 
+                                  lr=diffusion_model_training_config["learning_rate"])
 scaler = GradScaler()
 
-first_batch = first(train_loader)
-z = autoencoder.encode_stage_2_inputs(first_batch["image"].to(device))
-
-wandb.define_metric("diffusion/epoch")
-wandb.define_metric("diffusion/*", step_metric="diffusion/epoch")
-
-
-
-def eval_generate_sample_images(autoencoder, unet, scheduler, prefix_string):
-    autoencoder.eval()
-    unet.eval()
-
-    conditioning = torch.rand(run_config["batch_size"], 1, 1).to(device)
-    noise = torch.randn(encoding_shape).to(device)
-
-    scheduler.set_timesteps(num_inference_steps=1000)
-    for t in scheduler.timesteps:
-        with torch.no_grad():
-            with autocast(enabled=True):
-                noise_input = noise
-                noise_pred = unet(noise_input, timesteps=torch.Tensor((t,)).to(device), context=conditioning)
-
-            noise, _ = scheduler.step(noise_pred, t, noise)
-
-    with torch.no_grad():
-        decode = autoencoder.decode_stage_2_outputs
-        synthetic_images = decode(noise / scale_factor)
-
-    # ### Visualise synthetic data
-    for sample_index in range(run_config["batch_size"]):
-        img = synthetic_images[sample_index, 0].detach().cpu().numpy()  # images
-        log_image_to_wandb(img, None, prefix_string, WANDB_LOG_IMAGES, conditioning[sample_index, 0].detach().cpu())
-
-diffusion_stopwatch = Stopwatch("Diffusion training took:").start()
 LOGGER.info("Training new diffusion model...")
-for epoch in range(n_epochs):
-    unet.train()
-    epoch_loss = 0
+with Stopwatch("Diffusion training took:"):
+    train_diffusion_model(autoencoder=autoencoder,
+                          unet=unet, 
+                          optimizer_diff=optimizer_diff, 
+                          scaler=scaler, 
+                          inferer=inferer, 
+                          train_loader=train_loader,
+                          valid_loader=valid_loader,
+                          encoding_shape=encoding_shape,
+                          n_epochs=diffusion_model_training_config["n_epochs"],
+                          evaluation_intervall=run_config["evaluation_intervall"])
 
-    for step, batch in enumerate(train_loader):
-        images = batch["image"].to(device)
-        volume = batch["volume"].to(device)
-        optimizer_diff.zero_grad(set_to_none=True)
+LOGGER.info("Saving diffusion model as artifact")
+save_model_as_artifact(wandb_run, unet, type(unet).__name__, diffusion_model_unet_config)
 
-        with autocast(enabled=True):
-            # Generate random noise
-            noise = torch.randn(encoding_shape).to(device)
-
-            # Create timesteps
-            timesteps = torch.randint(
-                0, inferer.scheduler.num_train_timesteps, (images.shape[0],), device=images.device
-            ).long()
-
-            # Get model prediction
-            noise_pred = inferer(
-                inputs=images, autoencoder_model=autoencoder, diffusion_model=unet, noise=noise, timesteps=timesteps, condition=volume
-            )
-
-            loss = F.mse_loss(noise_pred.float(), noise.float())
-
-        scaler.scale(loss).backward()
-        scaler.step(optimizer_diff)
-        scaler.update()
-
-        epoch_loss += loss.item()
-
-    LOGGER.info(f"{epoch}: loss={epoch_loss / (step + 1):.5f}")
-    wandb.log({ "diffusion/epoch": epoch,
-                "diffusion/loss": epoch_loss / (step + 1),
-              })
-    epoch_loss_list.append(epoch_loss / (step + 1))
-
-    if (epoch + 1) in (np.round(np.arange(0.0, 1.01, run_config["gen_image_intervall"]) * n_epochs)):
-        with Stopwatch("Sampling example images took: "):
-            eval_generate_sample_images(autoencoder, unet, scheduler, "training/synthetic images")
-        with Stopwatch("Generating metrics took: "):
-            evaluate_diffusion_model(diffusion_model=unet, scheduler=scheduler, autoencoder=autoencoder, latent_shape=encoding_shape, inferer=inferer, val_loader=valid_loader, model_path=pretrained_model_directory)
-
-# -
-
-diffusion_stopwatch.stop().display()
-save_model_as_artifact(wandb_run, unet, type(unet).__name__, diffusion_model_unet_config, model_directory)
-
-# ### Plotting sampling example
-#
-# Finally, we generate an image with our LDM. For that, we will initialize a latent representation with just noise. Then, we will use the `unet` to perform 1000 denoising steps. In the last step, we decode the latent representation and plot the sampled image.
-
+LOGGER.info("Sampling from trained diffusion model...")
 for i in range(5):
-    eval_generate_sample_images(autoencoder, unet, scheduler, "Synthetic Images")
-
-# ## Clean-up data
+    generate_and_log_sample_images( autoencoder=autoencoder, unet=unet, 
+                                    scheduler=scheduler,
+                                    encoding_shape=encoding_shape, 
+                                    inferer=inferer,
+                                    prefix_string="diffusion/synthetic images")
 
 wandb.finish()

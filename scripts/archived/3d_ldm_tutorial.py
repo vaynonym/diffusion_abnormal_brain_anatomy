@@ -68,11 +68,8 @@ from src.util import load_wand_credentials, visualize_3d_image_slice_wise, Stopw
 from src.model_util import save_model_as_artifact, load_model_from_run_with_matching_config, check_dimensions
 from src.training import train_autoencoder
 from src.logging_util import LOGGER
+from src.directory_management import DATA_DIRECTORY
 
-directory = os.environ.get("DATA_DIRECTORY")
-base_directory = os.environ.get("BASE_DIRECTORY")
-output_directory = os.environ.get("OUTPUT_DIRECTORY")
-model_directory = os.environ.get("MODEL_DIRECTORY")
 
 WANDB_LOG_IMAGES = os.environ.get("WANDB_LOG_IMAGES")
 WANDB_RUN_NAME = os.environ.get("WANDB_RUN_NAME")
@@ -120,12 +117,12 @@ train_transforms = transforms.Compose(
 dataset_preparation_stopwatch = Stopwatch("Dataset preparation took: ").start()
 
 train_ds = DecathlonDataset(
-    root_dir=directory,
+    root_dir=DATA_DIRECTORY,
     task="Task01_BrainTumour",
     section="training",  # validation
     cache_rate=1.0,  # you may need a few Gb of RAM... Set to 0 otherwise
     num_workers=6,
-    download=not os.path.exists(os.path.join(directory, "Task01_BrainTumour")),  # Set download to True if the dataset hasnt been downloaded yet
+    download=not os.path.exists(os.path.join(DATA_DIRECTORY, "Task01_BrainTumour")),  # Set download to True if the dataset hasnt been downloaded yet
     seed=0,
     progress=False,
     transform=train_transforms,
@@ -154,18 +151,17 @@ for i in range(10):
 autoencoder = AutoencoderKL(**auto_encoder_config).to(device)
 
 # Try to load identically trained autoencoder if it already exists. Else train a new one.
-if not load_model_from_run_with_matching_config(subconfigs=[auto_encoder_config, auto_encoder_training_config, run_config],
-                                                subconfig_names=["auto_encoder_config", "auto_encoder_training_config", "run_config"],
+if not load_model_from_run_with_matching_config(subconfigs=[auto_encoder_config, auto_encoder_training_config],
+                                                subconfig_names=["auto_encoder_config", "auto_encoder_training_config"],
                                                 project=project, entity=entity, 
                                                 model=autoencoder, artifact_name="autoencoderKL",
-                                                models_path=model_directory,
                                                 ):
     LOGGER.info("Training new autoencoder...")
     autoencoder = train_autoencoder(autoencoder, train_loader, None,
-                                                    patch_discrim_config, auto_encoder_training_config, run_config,
+                                                    patch_discrim_config, auto_encoder_training_config, run_config["evaluation_intervall"],
                                                     WANDB_LOG_IMAGES)
 
-    save_model_as_artifact(wandb_run, autoencoder, type(autoencoder).__name__, auto_encoder_config, model_directory)
+    save_model_as_artifact(wandb_run, autoencoder, type(autoencoder).__name__, auto_encoder_config)
 else:
     LOGGER.info("Loaded existing autoencoder")
 
@@ -275,11 +271,11 @@ for epoch in range(n_epochs):
         eval_generate_sample_images(inferer, autoencoder, unet, scheduler, None, "Synthetic Images (training)")
 
 diffusion_stopwatch.stop().display()
-save_model_as_artifact(wandb_run, unet, type(unet).__name__, diffusion_model_unet_config, model_directory)
+save_model_as_artifact(wandb_run, unet, type(unet).__name__, diffusion_model_unet_config)
 
 # Finally, we generate an image with our LDM. For that, we will initialize a latent representation with just noise. Then, we will use the `unet` to perform 1000 denoising steps. In the last step, we decode the latent representation and plot the sampled image.
 
-eval_generate_sample_images(inferer, autoencoder, unet, scheduler, os.path.join(output_directory, "SyntheticImages.png"), "Synthetic Images")
+eval_generate_sample_images(inferer, autoencoder, unet, scheduler, None, "Synthetic Images")
 
 
 wandb.finish()

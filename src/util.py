@@ -28,7 +28,7 @@ def log_image_to_wandb(img: MetaTensor, reconstruction: MetaTensor = None, descr
     if conditioning_information:
         conditioning_information = round(conditioning_information.item(), 2)
     
-    img = torch.clamp(img, 0., 1.)
+    img = np.clip(img, 0., 1.)
 
     axial = img[..., img.shape[2] // 2]
     coronal = img[:, img.shape[1] // 2, ...]
@@ -47,7 +47,7 @@ def log_image_to_wandb(img: MetaTensor, reconstruction: MetaTensor = None, descr
     ax = axs[2 * multiplier]
     ax.imshow(sagittal, cmap="gray")
     if reconstruction is not None:
-        reconstruction = torch.clamp(reconstruction, 0., 1.)
+        reconstruction = np.clip(reconstruction, 0., 1.)
         axial_r = reconstruction[..., reconstruction.shape[2] // 2]
         coronal_r = reconstruction[:, reconstruction.shape[1] // 2, ...]
         sagittal_r = reconstruction[reconstruction.shape[0] // 2, ...]
@@ -68,6 +68,7 @@ def log_image_to_wandb(img: MetaTensor, reconstruction: MetaTensor = None, descr
     
     plt.cla()
     plt.clf()
+    plt.close("all")
 
 def visualize_reconstructions(train_loader, autoencoder, num_examples):
     # ### Visualise reconstructions

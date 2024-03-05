@@ -2,6 +2,7 @@ import torch
 import wandb
 import os
 from src.logging_util import LOGGER
+from src.directory_management import MODEL_DIRECTORY
 
 def save_model(model: torch.nn.Module, path: str, optimizer: torch.optim.Optimizer=None):
 
@@ -10,9 +11,9 @@ def save_model(model: torch.nn.Module, path: str, optimizer: torch.optim.Optimiz
         state["optimizer"] = optimizer.state_dict()
     torch.save(state, path)
 
-def save_model_as_artifact(wandb_run, model: torch.nn.Module, model_name: str, model_config: dict, path:str):
+def save_model_as_artifact(wandb_run, model: torch.nn.Module, model_name: str, model_config: dict):
     model_artifact = wandb.Artifact(model_name, type="model", metadata=dict(model_config))
-    file_path = os.path.join(path, model_name + ".pth")
+    file_path = os.path.join(MODEL_DIRECTORY, model_name + ".pth")
     save_model(model, file_path)
     model_artifact.add_file(file_path)
     wandb_run.log_artifact(model_artifact)
@@ -24,7 +25,7 @@ def load_model(model: torch.nn.Module, path: str, optimizer: torch.optim.Optimiz
     if optimizer is not None:
         optimizer.load_state_dict(state["optimizer"])
 
-def load_model_from_run_with_matching_config(subconfigs, subconfig_names, project, entity, model, artifact_name, models_path):
+def load_model_from_run_with_matching_config(subconfigs, subconfig_names, project, entity, model, artifact_name):
     
     filters = {
         "$and": [{f"config.{subconfig_name}": subconfig} for subconfig, subconfig_name in zip(subconfigs, subconfig_names)]
@@ -57,7 +58,7 @@ def load_model_from_run_with_matching_config(subconfigs, subconfig_names, projec
     file_name = f"{artifact_name}.pth"
 
     model_weights = fitting_artifact.get_entry(file_name)
-    tmp_path = os.path.join(models_path, "temp")
+    tmp_path = os.path.join(MODEL_DIRECTORY, "temp")
     model_weights.download(tmp_path)
     downloaded_file_path = os.path.join(tmp_path, file_name)
 
