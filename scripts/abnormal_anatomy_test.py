@@ -16,7 +16,7 @@ from generative.networks.schedulers import DDPMScheduler
 import wandb
 import numpy as np
 
-from src.util import load_wand_credentials, log_image_to_wandb, Stopwatch, device, read_config, visualize_reconstructions
+from src.util import load_wand_credentials, log_image_to_wandb, Stopwatch, read_config, visualize_reconstructions
 from src.model_util import save_model_as_artifact, load_model_from_run_with_matching_config, check_dimensions
 from src.training import train_autoencoder
 from src.logging_util import LOGGER
@@ -24,6 +24,8 @@ from src.datasets import SyntheticLDM100K
 from src.evaluation import evaluate_diffusion_model
 
 import torch.multiprocessing
+
+from src.torch_setup import device
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 

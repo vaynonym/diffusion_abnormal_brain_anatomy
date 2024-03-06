@@ -10,14 +10,22 @@ from generative.losses import PatchAdversarialLoss, PerceptualLoss
 from generative.networks.nets import AutoencoderKL, DiffusionModelUNet, PatchDiscriminator
 from generative.inferers import LatentDiffusionInferer
 
-from src.util import device, Stopwatch, log_image_to_wandb
+from src.util import Stopwatch, log_image_to_wandb
 from src.logging_util import LOGGER
 from src.evaluation import evaluate_autoencoder, evaluate_diffusion_model
 from src.diffusion import generate_and_log_sample_images
+from src.torch_setup import device
 
 
 
-def train_autoencoder(autoencoder: AutoencoderKL, train_loader: DataLoader, val_loader: DataLoader, patch_discrim_config: dict, auto_encoder_training_config: dict, evaluation_intervall: float, WANDB_LOG_IMAGES: bool):
+def train_autoencoder(autoencoder: AutoencoderKL,
+                      train_loader: DataLoader,
+                      val_loader: DataLoader,
+                      patch_discrim_config: dict,
+                      auto_encoder_training_config: dict,
+                      evaluation_intervall: float,
+                      WANDB_LOG_IMAGES: bool):
+    
     train_stopwatch = Stopwatch("Autoencoder training time: ").start()
 
     wandb_prefix = "autoencoder/training"

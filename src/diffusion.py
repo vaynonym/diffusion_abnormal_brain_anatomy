@@ -3,9 +3,11 @@ from generative.inferers import LatentDiffusionInferer
 from generative.networks.nets import AutoencoderKL, DiffusionModelUNet
 from generative.networks.schedulers import DDPMScheduler
 
-from src.util import device, log_image_to_wandb
+from src.util import log_image_to_wandb
 from src.logging_util import LOGGER
 from torch.cuda.amp import autocast
+
+from src.torch_setup import device
 
 
 def get_scale_factor(autoencoder: AutoencoderKL, sample_data: torch.Tensor) -> torch.Tensor:

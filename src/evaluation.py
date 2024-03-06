@@ -1,4 +1,4 @@
-from src.util import device, Stopwatch
+from src.util import Stopwatch, log_image_to_wandb
 from src.logging_util import LOGGER
 import torch
 import wandb
@@ -16,6 +16,7 @@ import torch.nn.functional as F
 import torchvision
 
 from src.directory_management import PRETRAINED_MODEL_DIRECTORY
+from src.torch_setup import device
 
 def evaluate_autoencoder(val_loader, autoencoder, is_training=True):
     metrics = { 
@@ -92,11 +93,18 @@ def evaluate_diffusion_model(diffusion_model: nn.Module,
 
     # get latent representations of all real data (for FID)
     with Stopwatch("Getting real features took: "):
-        for _, x in enumerate(val_loader):
+        for i, x in enumerate(val_loader):
             real_images = x["image"].to(device)
             with torch.no_grad():
-                real_images = medicalNetNormalize(real_images)
-                real_eval_feats : torch.Tensor = feature_extraction_model(real_images)
+                normalized = medicalNetNormalize(real_images)
+                if i < 2:
+                    log_image_to_wandb(real_images[0, 0].detach().cpu().numpy(), None, "MedicalnetNormalize/pristine", True, None, False)
+                    log_image_to_wandb(real_images[1, 0].detach().cpu().numpy(), None, "MedicalnetNormalize/pristine", True, None, False)
+
+                    log_image_to_wandb(normalized[0, 0].detach().cpu().numpy(), None, "MedicalnetNormalize/normalized", True, None, False)
+                    log_image_to_wandb(normalized[1, 0].detach().cpu().numpy(), None, "MedicalnetNormalize/normalized", True, None, False)
+
+                real_eval_feats : torch.Tensor = feature_extraction_model(normalized)
                 real_features.append(real_eval_feats)
 
     # calculate validation loss for sample

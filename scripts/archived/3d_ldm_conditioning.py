@@ -54,20 +54,20 @@ from monai.config import print_config
 from monai.data import DataLoader
 from monai.utils import first, set_determinism
 from torch.cuda.amp import GradScaler, autocast
-from tqdm import tqdm
-from monai.data.dataset import CacheDataset
 
 from generative.inferers import LatentDiffusionInferer
-from generative.networks.nets import AutoencoderKL, DiffusionModelUNet, PatchDiscriminator
+from generative.networks.nets import AutoencoderKL, DiffusionModelUNet
 from generative.networks.schedulers import DDPMScheduler
 
 import wandb
 import numpy as np
-from src.util import load_wand_credentials, visualize_3d_image_slice_wise, Stopwatch, device, read_config, visualize_reconstructions
+from src.util import load_wand_credentials, visualize_3d_image_slice_wise, Stopwatch, read_config, visualize_reconstructions
 from src.model_util import save_model_as_artifact, load_model_from_run_with_matching_config, check_dimensions
 from src.training import train_autoencoder
 from src.logging_util import LOGGER
 import random
+
+from src.torch_setup import device
 
 
 # Specify a MONAI_DATA_DIRECTORY variable, where the data will be downloaded. If not specified a temporary directory will be used.

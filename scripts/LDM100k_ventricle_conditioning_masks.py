@@ -71,20 +71,18 @@ def peek(x):
 
 train_transforms = transforms.Compose(
     [
-        transforms.LoadImaged(keys=["image"]),
-        transforms.EnsureChannelFirstd(keys=["image"]),
-        transforms.Lambdad(keys="image", func=lambda x: x[0, :, :, :]),
-        transforms.EnsureChannelFirstd(keys=["image"], channel_dim="no_channel"),
-        #transforms.Lambdad(keys="image", func=peek_shape),
+        transforms.LoadImaged(keys=["mask"]),
+        transforms.EnsureChannelFirstd(keys=["mask"]),
         #transforms.Lambdad(keys="volume", func=peek),
-        transforms.EnsureTyped(keys=["image"]),
-        transforms.Orientationd(keys=["image"], axcodes="IPL"), # axcodes="RAS"
-        transforms.Spacingd(keys=["image"], pixdim=run_config["input_image_downsampling_factors"], mode=("bilinear")),
-        transforms.CenterSpatialCropd(keys=["image"], roi_size=run_config["input_image_crop_roi"]),
-        transforms.ScaleIntensityRangePercentilesd(keys="image", lower=0.5, upper=99.5, b_min=0, b_max=1),
+        transforms.EnsureTyped(keys=["mask"]),
+        transforms.Orientationd(keys=["mask"], axcodes="IPL"), # axcodes="RAS"
+        transforms.Spacingd(keys=["mask"], pixdim=run_config["input_image_downsampling_factors"], mode=("nearest")),
+        transforms.CenterSpatialCropd(keys=["mask"], roi_size=run_config["input_image_crop_roi"]),
+        #transforms.ScaleIntensityRangePercentilesd(keys="mask", lower=0.5, upper=99.5, b_min=0, b_max=1),
         transforms.Lambdad(keys=["volume"], func = lambda x: torch.tensor(x, dtype=torch.float32).unsqueeze(0).unsqueeze(0)),
     ]
 )
+
 
 LOGGER.info("Loading dataset...")
 dataset_preparation_stopwatch = Stopwatch("Done! Loading the Dataset took: ").start()
@@ -119,7 +117,7 @@ dataset_preparation_stopwatch.stop().display()
 
 LOGGER.info(f"Train length: {len(train_ds)} in {len(train_loader)} batches")
 LOGGER.info(f"Valid length: {len(validation_ds)} in {len(valid_loader)} batches")
-LOGGER.info(f'Image shape {train_ds[0]["image"].shape}')
+LOGGER.info(f'Mask shape {train_ds[0]["mask"].shape}')
 
 down_sampling_factor = (2 ** (len(auto_encoder_config["num_channels"]) -1) )
 dim_xyz = tuple(map(lambda x: x // down_sampling_factor, run_config["input_image_crop_roi"]))
@@ -129,19 +127,28 @@ LOGGER.info(f"Encoding shape: {encoding_shape}")
 # ### Visualise examples from the training set
 iterator = enumerate(train_loader)
 sample_data = None # reused later
+classes = set()
 for i in range(3):
     _, sample_data = next(iterator)
     sample_index = 0
-    img = sample_data["image"][sample_index, 0].detach().cpu().numpy()
-    log_image_to_wandb(img, None, "trainingdata", WANDB_LOG_IMAGES, conditioning_information=sample_data["volume"][sample_index].unsqueeze(0))
+    img = sample_data["mask"][sample_index, 0].detach().cpu().numpy()
+    print(f"Max value {img.max()}")
+    print(f"Max value {img.min()}")
+    log_image_to_wandb(img, None, "trainingdata", WANDB_LOG_IMAGES, conditioning_information=sample_data["volume"][sample_index].unsqueeze(0), clip=False)
 
-LOGGER.info(f"Batch image shape: {sample_data['image'].shape}")
+    classes = classes.union(set(np.unique(img)))
+
+print(f"Number of classes: {len(classes)}")
+print(f"classes: {classes}")
+
+
+LOGGER.info(f"Batch image shape: {sample_data['mask'].shape}")
 
 autoencoder = AutoencoderKL(**auto_encoder_config).to(device)
 
 # Try to load identically trained autoencoder if it already exists. Else train a new one.
-if not load_model_from_run_with_matching_config([auto_encoder_config, auto_encoder_training_config, patch_discrim_config],
-                                            ["auto_encoder_config", "auto_encoder_training_config", "patch_discrim_config"],
+if not load_model_from_run_with_matching_config([auto_encoder_config],
+                                            ["auto_encoder_config"],
                                             project=project, entity=entity, 
                                             model=autoencoder, artifact_name=AutoencoderKL.__name__,
                                             ):

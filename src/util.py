@@ -10,12 +10,12 @@ from datetime import timedelta
 from src.logging_util import LOGGER, all_logging_disabled
 import yaml
 from pathlib import Path
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-LOGGER.info(f"Using {torch.cuda.get_device_name(device) if torch.cuda.is_available() else 'cpu'}")
+from src.directory_management import BASE_DIRECTORY
+import os
+from src.torch_setup import device
 
 def load_wand_credentials():
-    with open("./local_config.yml") as file:
+    with open(os.path.join(BASE_DIRECTORY, "local_config.yml")) as file:
         local_user_config = yaml.safe_load(file)
     
     return local_user_config["project"], local_user_config["entity"]
@@ -24,11 +24,11 @@ def normalize(x):
     return (x - np.min(x)) / (np.max(x) - np.min(x))
 
 # setting path to None means no graph will be created and only images logged
-def log_image_to_wandb(img: MetaTensor, reconstruction: MetaTensor = None, description_prefix="", log_to_wandb=False, conditioning_information=None):
+def log_image_to_wandb(img: MetaTensor, reconstruction: MetaTensor = None, description_prefix="", log_to_wandb=False, conditioning_information=None, clip=True):
     if conditioning_information:
         conditioning_information = round(conditioning_information.item(), 2)
-    
-    img = np.clip(img, 0., 1.)
+    if clip:
+        img = np.clip(img, 0., 1.)
 
     axial = img[..., img.shape[2] // 2]
     coronal = img[:, img.shape[1] // 2, ...]

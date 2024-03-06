@@ -64,11 +64,12 @@ from generative.networks.schedulers import DDPMScheduler
 
 import wandb
 import numpy as np
-from src.util import load_wand_credentials, visualize_3d_image_slice_wise, Stopwatch, device, read_config, visualize_reconstructions
+from src.util import load_wand_credentials, visualize_3d_image_slice_wise, Stopwatch, read_config, visualize_reconstructions
 from src.model_util import save_model_as_artifact, load_model_from_run_with_matching_config, check_dimensions
 from src.training import train_autoencoder
 from src.logging_util import LOGGER
 from src.directory_management import DATA_DIRECTORY
+from src.torch_setup import device
 
 
 WANDB_LOG_IMAGES = os.environ.get("WANDB_LOG_IMAGES")
