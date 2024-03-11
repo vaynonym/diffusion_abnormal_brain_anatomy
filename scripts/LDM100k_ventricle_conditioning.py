@@ -23,6 +23,7 @@ from src.logging_util import LOGGER
 from src.datasets import SyntheticLDM100K
 from src.diffusion import get_scale_factor, generate_and_log_sample_images
 from src.directory_management import DATA_DIRECTORY
+from src.trainer import AutoencoderTrainer
 
 import torch.multiprocessing
 
@@ -81,7 +82,7 @@ train_transforms = transforms.Compose(
         transforms.Orientationd(keys=["image"], axcodes="IPL"), # axcodes="RAS"
         transforms.Spacingd(keys=["image"], pixdim=run_config["input_image_downsampling_factors"], mode=("bilinear")),
         transforms.CenterSpatialCropd(keys=["image"], roi_size=run_config["input_image_crop_roi"]),
-        transforms.ScaleIntensityRangePercentilesd(keys="image", lower=0.5, upper=99.5, b_min=0, b_max=1),
+        transforms.ScaleIntensityRangePercentilesd(keys=["image"], lower=0.5, upper=99.5, b_min=0, b_max=1, clip=True),
         transforms.Lambdad(keys=["volume"], func = lambda x: torch.tensor(x, dtype=torch.float32).unsqueeze(0).unsqueeze(0)),
     ]
 )
@@ -146,9 +147,16 @@ if not load_model_from_run_with_matching_config([auto_encoder_config, auto_encod
                                             model=autoencoder, artifact_name=AutoencoderKL.__name__,
                                             ):
     LOGGER.info("Training new autoencoder...")
-    autoencoder = train_autoencoder(autoencoder, train_loader, valid_loader,
-                                                    patch_discrim_config, auto_encoder_training_config, run_config["evaluation_intervall"],
-                                                    WANDB_LOG_IMAGES)
+    trainer = AutoencoderTrainer(autoencoder=autoencoder, 
+                                 train_loader=train_loader, val_loader=valid_loader, 
+                                 patch_discrim_config=patch_discrim_config, auto_encoder_training_config=auto_encoder_training_config,
+                                 WANDB_LOG_IMAGES=WANDB_LOG_IMAGES,
+                                 evaluation_intervall=run_config["evaluation_intervall"])
+
+    autoencoder = trainer.train()
+
+    # clean up fully
+    del trainer
 
     save_model_as_artifact(wandb_run, autoencoder, type(autoencoder).__name__, auto_encoder_config)
 else:
@@ -156,6 +164,7 @@ else:
 
 visualize_reconstructions(train_loader, autoencoder, 10)
 
+quit()
 
 unet = DiffusionModelUNet(**diffusion_model_unet_config).to(device)
 scheduler = DDPMScheduler(num_train_timesteps=1000, schedule="scaled_linear_beta", beta_start=0.0015, beta_end=0.0205, clip_sample=False)

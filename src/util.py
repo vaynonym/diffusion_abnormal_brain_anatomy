@@ -13,6 +13,7 @@ from pathlib import Path
 from src.directory_management import BASE_DIRECTORY
 import os
 from src.torch_setup import device
+from src.synthseg_masks import synthseg_classes, synthseg_class_to_string_map
 
 def load_wand_credentials():
     with open(os.path.join(BASE_DIRECTORY, "local_config.yml")) as file:
@@ -23,12 +24,57 @@ def load_wand_credentials():
 def normalize(x):
     return (x - np.min(x)) / (np.max(x) - np.min(x))
 
-# setting path to None means no graph will be created and only images logged
-def log_image_to_wandb(img: MetaTensor, reconstruction: MetaTensor = None, description_prefix="", log_to_wandb=False, conditioning_information=None, clip=True):
+def log_image_with_mask(image: np.ndarray, 
+                        original_mask: np.ndarray,
+                        reconstruction_image: np.ndarray = None,
+                        reconstruction_mask: np.ndarray = None,
+                        description_prefix="",
+                        conditioning_information=None,
+                        ):
+
     if conditioning_information:
         conditioning_information = round(conditioning_information.item(), 2)
-    if clip:
-        img = np.clip(img, 0., 1.)
+
+    data = []
+    for name, get_indices in [ 
+                              ("axial", lambda x:  x[..., x.shape[2] // 2]),
+                              ("coronal", lambda x: x[:, x.shape[1] // 2, ...]),
+                              ("sagittal", lambda x: x[x.shape[0] // 2, ...]),
+                             ]:
+        input_image = wandb.Image(get_indices(image), 
+                masks={ "image": {
+                                            "mask_data": get_indices(original_mask),
+                                            "class_labels": synthseg_class_to_string_map
+                                          }
+             })
+        
+
+        if reconstruction_image is not None and reconstruction_mask is not None:
+            reconstruction_image = wandb.Image(
+                get_indices(image), 
+                masks={ "reconstruction": {
+                                            "mask_data": get_indices(reconstruction_mask),
+                                            "class_labels": synthseg_class_to_string_map
+                                          }
+                      },
+                )
+        data.append([name, conditioning_information, input_image, reconstruction_image])
+    table = wandb.Table(columns=["type", "conditioning", "image", "reconstruction"], data=data)
+
+    wandb.log({description_prefix: table})
+    
+
+# setting path to None means no graph will be created and only images logged
+def log_image_to_wandb(img: np.ndarray,
+                       reconstruction: np.ndarray = None,
+                       description_prefix="",
+                       log_to_wandb=False,
+                       conditioning_information=None,
+                       preprocess_image=None):
+    if conditioning_information:
+        conditioning_information = round(conditioning_information.item(), 2)
+    if preprocess_image:
+        img = preprocess_image(img)
 
     axial = img[..., img.shape[2] // 2]
     coronal = img[:, img.shape[1] // 2, ...]
@@ -47,6 +93,8 @@ def log_image_to_wandb(img: MetaTensor, reconstruction: MetaTensor = None, descr
     ax = axs[2 * multiplier]
     ax.imshow(sagittal, cmap="gray")
     if reconstruction is not None:
+        if preprocess_image:
+            reconstruction = preprocess_image(reconstruction)
         reconstruction = np.clip(reconstruction, 0., 1.)
         axial_r = reconstruction[..., reconstruction.shape[2] // 2]
         coronal_r = reconstruction[:, reconstruction.shape[1] // 2, ...]

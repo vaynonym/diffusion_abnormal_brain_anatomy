@@ -1,5 +1,8 @@
 import torch
 from src.torch_setup import device
+from generative.networks.nets.autoencoderkl import AutoencoderKL 
+import torch.nn as nn
+from typing import Tuple
 
 synthseg_classes = [ 0,  2,  3,  4,  5,  7,  8, 10, 11,
                      12, 13, 14, 15, 16, 17, 18, 24, 26,
@@ -50,9 +53,12 @@ def encode_one_hot(mask: torch.Tensor, device=device):
     one_hot = torch.zeros(shp).to(device)
     for channel in range(len(synthseg_classes)):
         one_hot[:, channel, ...] = mask[:, 0, ...] == synthseg_index_mask_value_map[channel]
+    
     return one_hot
 
 def decode_one_hot(mask: torch.Tensor, device=device):
+    # [B, C, SPATIALS]
+    assert len(list(mask.shape)) == 5
     unhotted = mask.argmax(1, keepdim=True)
 
     base = torch.arange(0, len(synthseg_classes)).to(device)
@@ -60,4 +66,6 @@ def decode_one_hot(mask: torch.Tensor, device=device):
 
     index = torch.bucketize(unhotted.ravel(), base)
 
-    return classes[index].reshape(unhotted.shape) 
+    return (classes[index].reshape(unhotted.shape)).to(torch.int32)
+
+

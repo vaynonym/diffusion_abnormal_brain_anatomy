@@ -2,6 +2,7 @@
 
 # Set up imports
 import os
+os.environ["CUDA_LAUNCH_BLOCKING"]= "1"
 import torch
 import torch.nn.functional as F
 from monai import transforms
@@ -16,13 +17,14 @@ from generative.networks.schedulers import DDPMScheduler
 import wandb
 import numpy as np
 
-from src.util import load_wand_credentials, log_image_to_wandb, Stopwatch, read_config, visualize_reconstructions
+from src.util import load_wand_credentials, log_image_to_wandb, Stopwatch, read_config, visualize_reconstructions, log_image_with_mask
 from src.model_util import save_model_as_artifact, load_model_from_run_with_matching_config, check_dimensions
-from src.training import train_autoencoder, train_diffusion_model
+from src.training import train_diffusion_model
 from src.logging_util import LOGGER
 from src.datasets import SyntheticLDM100K
 from src.diffusion import get_scale_factor, generate_and_log_sample_images
 from src.directory_management import DATA_DIRECTORY
+from src.trainer import SegmentationAutoencoderTrainer
 
 import torch.multiprocessing
 
@@ -64,6 +66,14 @@ def peek_shape(x):
     LOGGER.info(x.shape)
     return x
 
+def peek_max(x):
+    LOGGER.info(f"max {x.max()}")
+    return x
+
+def peek_min(x):
+    LOGGER.info(f"min {x.min()}")
+    return x
+
 def peek(x):
     LOGGER.info(x)
     return x
@@ -71,14 +81,14 @@ def peek(x):
 
 train_transforms = transforms.Compose(
     [
-        transforms.LoadImaged(keys=["mask"]),
-        transforms.EnsureChannelFirstd(keys=["mask"]),
-        #transforms.Lambdad(keys="volume", func=peek),
-        transforms.EnsureTyped(keys=["mask"]),
-        transforms.Orientationd(keys=["mask"], axcodes="IPL"), # axcodes="RAS"
+        transforms.LoadImaged(keys=["mask", "image"]),
+        transforms.EnsureChannelFirstd(keys=["mask", "image"]),
+        transforms.EnsureTyped(keys=["mask", "image"]),
+        transforms.Orientationd(keys=["mask", "image"], axcodes="IPL"), # axcodes="RAS"
         transforms.Spacingd(keys=["mask"], pixdim=run_config["input_image_downsampling_factors"], mode=("nearest")),
-        transforms.CenterSpatialCropd(keys=["mask"], roi_size=run_config["input_image_crop_roi"]),
-        #transforms.ScaleIntensityRangePercentilesd(keys="mask", lower=0.5, upper=99.5, b_min=0, b_max=1),
+        transforms.Spacingd(keys=["image"], pixdim=run_config["input_image_downsampling_factors"], mode=("bilinear")),
+        transforms.CenterSpatialCropd(keys=["mask", "image"], roi_size=run_config["input_image_crop_roi"]),
+        transforms.ScaleIntensityRangePercentilesd(keys=["image"], lower=0.5, upper=99.5, b_min=0, b_max=1, clip=True),
         transforms.Lambdad(keys=["volume"], func = lambda x: torch.tensor(x, dtype=torch.float32).unsqueeze(0).unsqueeze(0)),
     ]
 )
@@ -124,22 +134,16 @@ dim_xyz = tuple(map(lambda x: x // down_sampling_factor, run_config["input_image
 encoding_shape = (run_config["batch_size"], auto_encoder_config["latent_channels"], dim_xyz[0], dim_xyz[1], dim_xyz[2])
 LOGGER.info(f"Encoding shape: {encoding_shape}")
 
+
 # ### Visualise examples from the training set
 iterator = enumerate(train_loader)
 sample_data = None # reused later
-classes = set()
 for i in range(3):
     _, sample_data = next(iterator)
     sample_index = 0
-    img = sample_data["mask"][sample_index, 0].detach().cpu().numpy()
-    print(f"Max value {img.max()}")
-    print(f"Max value {img.min()}")
-    log_image_to_wandb(img, None, "trainingdata", WANDB_LOG_IMAGES, conditioning_information=sample_data["volume"][sample_index].unsqueeze(0), clip=False)
-
-    classes = classes.union(set(np.unique(img)))
-
-print(f"Number of classes: {len(classes)}")
-print(f"classes: {classes}")
+    mask = sample_data["mask"][sample_index, 0].detach().cpu().numpy()
+    image = sample_data["image"][sample_index, 0].detach().cpu().numpy()
+    log_image_with_mask(image, mask, None, None, "trainingdata", sample_data["volume"][sample_index])
 
 
 LOGGER.info(f"Batch image shape: {sample_data['mask'].shape}")
@@ -147,22 +151,30 @@ LOGGER.info(f"Batch image shape: {sample_data['mask'].shape}")
 autoencoder = AutoencoderKL(**auto_encoder_config).to(device)
 
 # Try to load identically trained autoencoder if it already exists. Else train a new one.
-if not load_model_from_run_with_matching_config([auto_encoder_config],
-                                            ["auto_encoder_config"],
-                                            project=project, entity=entity, 
+if not load_model_from_run_with_matching_config([auto_encoder_config, auto_encoder_training_config, patch_discrim_config],
+                                            ["auto_encoder_config", "auto_encoder_training_config", "patch_discrim_config"],
+                                            project=project, entity=entity,
                                             model=autoencoder, artifact_name=AutoencoderKL.__name__,
                                             ):
     LOGGER.info("Training new autoencoder...")
-    autoencoder = train_autoencoder(autoencoder, train_loader, valid_loader,
-                                                    patch_discrim_config, auto_encoder_training_config, run_config["evaluation_intervall"],
-                                                    WANDB_LOG_IMAGES)
+    trainer = SegmentationAutoencoderTrainer(autoencoder=autoencoder, 
+                                 train_loader=train_loader, val_loader=valid_loader, 
+                                 patch_discrim_config=patch_discrim_config, auto_encoder_training_config=auto_encoder_training_config,
+                                 WANDB_LOG_IMAGES=WANDB_LOG_IMAGES,
+                                 evaluation_intervall=run_config["evaluation_intervall"])
+
+    autoencoder = trainer.train()
+
+    # clean up fully
+    del trainer
 
     save_model_as_artifact(wandb_run, autoencoder, type(autoencoder).__name__, auto_encoder_config)
 else:
     LOGGER.info("Loaded existing autoencoder")
 
-visualize_reconstructions(train_loader, autoencoder, 10)
+#visualize_reconstructions(train_loader, autoencoder, 10)
 
+quit()
 
 unet = DiffusionModelUNet(**diffusion_model_unet_config).to(device)
 scheduler = DDPMScheduler(num_train_timesteps=1000, schedule="scaled_linear_beta", beta_start=0.0015, beta_end=0.0205, clip_sample=False)

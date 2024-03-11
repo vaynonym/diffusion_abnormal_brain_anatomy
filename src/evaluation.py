@@ -14,41 +14,123 @@ import os.path
 from collections import OrderedDict
 import torch.nn.functional as F
 import torchvision
+from typing import Tuple, Optional
 
 from src.directory_management import PRETRAINED_MODEL_DIRECTORY
 from src.torch_setup import device
+from src.util import log_image_with_mask, log_image_to_wandb
+from src.synthseg_masks import decode_one_hot, encode_one_hot
 
-def evaluate_autoencoder(val_loader, autoencoder, is_training=True):
-    metrics = { 
-        "MS-SSIM": MultiScaleSSIMMetric(spatial_dims=3, data_range=1.0, kernel_size=4),
-        "SSIM": SSIMMetric(spatial_dims=3, data_range=1.0, kernel_size=4),
-        "MMD": MMDMetric(),
-    }
+class AutoencoderEvaluator():
+
+    def __init__(self,
+                 autoencoder: AutoencoderKL,
+                 val_loader: Optional[DataLoader],
+                 wandb_prefix: str,
+                 ) -> None:
+        self.autoencoder = autoencoder
+        self.wandb_prefix = wandb_prefix
+        self.val_loader = val_loader
+  
+    def prepare_input_for_logging(self, input):
+        return torch.clamp(input, 0, 1)
     
-    accumulations = [[] for _ in metrics.keys()]
+    def get_input_from_batch(self, batch) -> Tuple[torch.Tensor, None]:
+        return (batch["image"].to(device), None)   
+    
+    def visualize_batch(self, batch):
+        with torch.no_grad():
+            self.autoencoder.eval()
+            x, _ = self.get_input_from_batch(batch)  # choose only one of Brats channels
+
+            reconstruction = self.autoencoder.reconstruct(x)
+            conditioning=batch["volume"][0].detach().cpu()
+            
+            wandb.log({f"{self.wandb_prefix}/max_r_intensity": reconstruction.max(), f"{self.wandb_prefix}/min_r_intensity": reconstruction.min()})
+
+            reconstruction_for_logging = self.prepare_input_for_logging(reconstruction)[0, 0].detach().cpu().numpy()
+            image_for_logging = self.prepare_input_for_logging(x)[0, 0].detach().cpu().numpy()
+
+            log_image_to_wandb(image_for_logging, reconstruction_for_logging, f"{self.wandb_prefix}/reconstruction", self.WANDB_LOG_IMAGES,
+                        conditioning_information=conditioning)
+    
+    def evaluate(self,
+                         is_training=True):
+        if self.val_loader is None:
+            print("Cannot evaluate without validation dataloader")
+            return
+
+        self.autoencoder.eval()
+        
+        metrics = { 
+            "MS-SSIM": MultiScaleSSIMMetric(spatial_dims=3, data_range=1.0, kernel_size=4),
+            "SSIM": SSIMMetric(spatial_dims=3, data_range=1.0, kernel_size=4),
+            "MMD": MMDMetric(),
+        }
+        
+        accumulations = [[] for _ in metrics.keys()]
 
 
-    for _, batch in enumerate(val_loader):
-        image = batch["image"].to(device)
+        for _, batch in enumerate(self.val_loader):
+            x, _ = self.get_input_from_batch(batch)
+
+            with torch.no_grad():
+                reconstruction = self.autoencoder.reconstruct(x)
+
+                for metric, accumulator in zip(metrics.values(), accumulations):
+                    res = metric(x, reconstruction)
+                    if(len(res.size()) == 0):
+                        res = res.unsqueeze(0)
+                    accumulator.append(res)
 
         with torch.no_grad():
-            image_recon = autoencoder.reconstruct(image)
+            prefix = "autoencoder/training" if is_training else "autoencoder"
+            wandb.log(
+                {
+                    f"{prefix}/{name}": (torch.cat(accumulator, dim=0).mean().item()) for (name, accumulator) in zip(metrics.keys(), accumulations)
+                }
+            )
+        
+        return None
 
-            for metric, accumulator in zip(metrics.values(), accumulations):
-                res = metric(image, image_recon)
-                if(len(res.size()) == 0):
-                    res = res.unsqueeze(0)
-                accumulator.append(res)
+class MaskAutoencoderEvaluator(AutoencoderEvaluator):
+    def __init__(self, 
+                 autoencoder: AutoencoderKL,
+                 val_loader: Optional[DataLoader],
+                 wandb_prefix: str,
+                 ) -> None:
+        super().__init__(autoencoder, val_loader, wandb_prefix)
 
-    with torch.no_grad():
-        prefix = "autoencoder/training" if is_training else "autoencoder"
-        wandb.log(
-            {
-                f"{prefix}/{name}": (torch.cat(accumulator, dim=0).mean().item()) for (name, accumulator) in zip(metrics.keys(), accumulations)
-            }
-        )
+    def prepare_input_for_logging(self, input):
+        return decode_one_hot(input)
     
-    return None
+    def get_input_from_batch(self, batch) -> Tuple[torch.Tensor, None]:
+        mask = encode_one_hot(batch["mask"].to(device))
+        return (mask, None)
+
+    def visualize_batch(self, batch):
+        # select first sample from last training batch as example evaluation
+        with torch.no_grad():
+            self.autoencoder.eval()
+            image = super().prepare_input_for_logging(batch["image"].to(device))[0, 0].detach().cpu().numpy()
+            original_mask = batch["mask"][0, 0].detach().cpu().numpy()
+            conditioning=batch["volume"][0].detach().cpu()
+
+            x, _ = self.get_input_from_batch(batch)
+            reconstruction = self.autoencoder.reconstruct(x)
+            
+            # log intensity values
+            wandb.log({f"{self.wandb_prefix}/max_r_intensity": reconstruction.max().item(),
+                        f"{self.wandb_prefix}/min_r_intensity": reconstruction.min().item()})
+
+            reconstructed_mask_decoded = self.prepare_input_for_logging(reconstruction)[0, 0].detach().cpu().numpy()
+
+            log_image_with_mask(image=image, 
+                                original_mask=original_mask,
+                                reconstruction_image=image,
+                                reconstruction_mask=reconstructed_mask_decoded,
+                                description_prefix=f"{self.wandb_prefix}/masks_reconstruction",
+                                conditioning_information=conditioning) 
 
 
 ############### Diffusion Model Evaluation #####################
@@ -58,9 +140,13 @@ def evaluate_diffusion_model(diffusion_model: nn.Module,
                              autoencoder: AutoencoderKL,
                              latent_shape: torch.Tensor,
                              inferer: LatentDiffusionInferer,
-                             val_loader: DataLoader):
+                             val_loader: DataLoader,
+                             get_input_from_batch = lambda batch: (batch["image"].to(device), batch["volume"].to(device))
+                             ):
     weights_path = os.path.join(PRETRAINED_MODEL_DIRECTORY, "resnet_50.pth")
     assert os.path.exists(weights_path)
+
+    diffusion_model.eval()
 
     feature_extraction_model = resnet50(pretrained=False,
                                         shortcut_type="B",
@@ -93,16 +179,16 @@ def evaluate_diffusion_model(diffusion_model: nn.Module,
 
     # get latent representations of all real data (for FID)
     with Stopwatch("Getting real features took: "):
-        for i, x in enumerate(val_loader):
-            real_images = x["image"].to(device)
+        for i, batch in enumerate(val_loader):
+            real_images, _ = get_input_from_batch(batch)
             with torch.no_grad():
                 normalized = medicalNetNormalize(real_images)
                 if i < 2:
-                    log_image_to_wandb(real_images[0, 0].detach().cpu().numpy(), None, "MedicalnetNormalize/pristine", True, None, False)
-                    log_image_to_wandb(real_images[1, 0].detach().cpu().numpy(), None, "MedicalnetNormalize/pristine", True, None, False)
+                    log_image_to_wandb(real_images[0, 0].detach().cpu().numpy(), None, "MedicalnetNormalize/pristine", True, None, None)
+                    log_image_to_wandb(real_images[1, 0].detach().cpu().numpy(), None, "MedicalnetNormalize/pristine", True, None, None)
 
-                    log_image_to_wandb(normalized[0, 0].detach().cpu().numpy(), None, "MedicalnetNormalize/normalized", True, None, False)
-                    log_image_to_wandb(normalized[1, 0].detach().cpu().numpy(), None, "MedicalnetNormalize/normalized", True, None, False)
+                    log_image_to_wandb(normalized[0, 0].detach().cpu().numpy(), None, "MedicalnetNormalize/normalized", True, None, None)
+                    log_image_to_wandb(normalized[1, 0].detach().cpu().numpy(), None, "MedicalnetNormalize/normalized", True, None, None)
 
                 real_eval_feats : torch.Tensor = feature_extraction_model(normalized)
                 real_features.append(real_eval_feats)
@@ -110,10 +196,9 @@ def evaluate_diffusion_model(diffusion_model: nn.Module,
     # calculate validation loss for sample
     # get latent representations of synthetic images (for FID)
     number_images_to_consider = 20
-    for _, x in enumerate(val_loader):
+    for _, batch in enumerate(val_loader):
         # Get the real images
-        real_images = x["image"].to(device)
-        conditioning = x["volume"].to(device)
+        real_images, conditioning = get_input_from_batch(batch)
 
         # Generate some synthetic images using the defined model
         latent_noise = torch.randn(latent_shape).to(device)
