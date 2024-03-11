@@ -25,7 +25,7 @@ class SyntheticLDM100K(Randomizable, CacheDataset):
         seed=0,
         size=1000,
         val_frac=0.2,
-        test_frac=0.2,
+        test_frac=0.0,
         cache_num=sys.maxsize,
         cache_rate=1.0,
         num_workers=0,

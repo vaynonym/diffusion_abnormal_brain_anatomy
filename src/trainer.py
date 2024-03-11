@@ -12,13 +12,16 @@ from generative.networks.nets import AutoencoderKL, DiffusionModelUNet, PatchDis
 from generative.inferers import LatentDiffusionInferer
 
 from src.util import Stopwatch, log_image_to_wandb, log_image_with_mask
+from src.model_util import save_model
 from src.logging_util import LOGGER
 from src.evaluation import evaluate_diffusion_model
 from src.diffusion import generate_and_log_sample_images
 from src.torch_setup import device
 from src.synthseg_masks import decode_one_hot, encode_one_hot
-from typing import Tuple
 from src.evaluation import AutoencoderEvaluator, MaskAutoencoderEvaluator
+from src.directory_management import MODEL_DIRECTORY
+from typing import Tuple
+import os
 
 class AutoencoderTrainer():
 
@@ -29,7 +32,9 @@ class AutoencoderTrainer():
                  patch_discrim_config: dict,
                  auto_encoder_training_config: dict,
                  evaluation_intervall: float,
-                 WANDB_LOG_IMAGES: bool) -> None:
+                 WANDB_LOG_IMAGES: bool,
+                 starting_epoch=0,
+                 ) -> None:
 
         self.autoencoder : AutoencoderKL = autoencoder
         self.train_loader = train_loader
@@ -52,6 +57,13 @@ class AutoencoderTrainer():
         self.optimizer_d = torch.optim.Adam(params=self.discriminator.parameters(), lr=self.lr)
 
         self.n_epochs = auto_encoder_training_config["n_epochs"]
+        self.current_epoch = starting_epoch
+        assert self.current_epoch <= self.n_epochs
+        
+        # continue training from checkpoint
+        if self.current_epoch != 0:
+            self.load_state()
+
         self.autoencoder_warm_up_n_epochs = auto_encoder_training_config["autoencoder_warm_up_n_epochs"]
 
         self.WANDB_LOG_IMAGES = WANDB_LOG_IMAGES
@@ -72,7 +84,7 @@ class AutoencoderTrainer():
         
         train_stopwatch = Stopwatch("Autoencoder training time: ").start()
 
-        for epoch in range(self.n_epochs):
+        for epoch in range(self.current_epoch, self.n_epochs):
             self.autoencoder.train()
             self.discriminator.train()
             epoch_loss = 0
@@ -80,7 +92,7 @@ class AutoencoderTrainer():
             disc_epoch_loss = 0
 
             for step, batch in enumerate(self.train_loader):
-                step_loss, gen_step_loss, disc_step_loss, reconstruction = self.do_step(batch, epoch)
+                step_loss, gen_step_loss, disc_step_loss = self.do_step(batch, epoch)
                 epoch_loss += step_loss
                 gen_epoch_loss += gen_step_loss
                 disc_epoch_loss += disc_step_loss
@@ -89,8 +101,15 @@ class AutoencoderTrainer():
 
             if epoch + 1 in (np.round(np.arange(0.0, 1.01, self.evaluation_intervall) * self.n_epochs)):
                 self.evaluator.visualize_batch(batch=batch)
+                
                 with Stopwatch("Validation took: "):
                     self.evaluator.evaluate()
+
+                with Stopwatch("Saving new state took: "):
+                    previously_saved_epoch = self.current_epoch
+                    self.current_epoch = epoch + 1
+                    self.save_state()
+                    self.delete_save(previously_saved_epoch)
 
         # clean up data
         self.clean_up()
@@ -98,6 +117,34 @@ class AutoencoderTrainer():
         train_stopwatch.stop().display()
 
         return self.autoencoder
+        
+    def save_state(self):
+
+        state = {f"model_{self.autoencoder.__class__.__name__}": self.autoencoder.state_dict(),
+                 f"discriminator": self.discriminator.state_dict(),
+                 f"optimizer_g": self.optimizer_g.state_dict(),
+                 f"optimizer_d": self.optimizer_d.state_dict()
+                 }
+        torch.save(state, os.path.join(MODEL_DIRECTORY, f"{self.__class__.__name__}_E{self.current_epoch}.pth"))
+    
+    def delete_save(self, epoch):
+        path = os.path.join(MODEL_DIRECTORY, f"{self.__class__.__name__}_E{epoch}.pth")
+        if os.path.exists(path):
+            os.remove(path)
+    
+    def load_state(self):
+        path = os.path.join(MODEL_DIRECTORY, f"{self.__class__.__name__}_E{self.current_epoch}.pth")
+        assert os.path.exists(path), f"Since starting epoch is not zero, expects state to exist at: {path}"
+
+        state = torch.load(path, map_location=device)
+
+        autoencoder_name = f"model_{self.autoencoder.__class__.__name__}"
+        assert autoencoder_name in state.keys(), f"Autoencoder with class {self.autoencoder.__class__.__name__} not present in saved state"
+
+        self.autoencoder.load_state_dict(state[autoencoder_name])
+        self.discriminator.load_state_dict(state["discriminator"])
+        self.optimizer_g.load_state_dict(state["optimizer_g"])
+        self.optimizer_d.load_state_dict(state["optimizer_d"])
         
     def do_step(self, batch, epoch):
         (step_loss, gen_step_loss, disc_step_loss) = (0, 0, 0)
@@ -136,7 +183,7 @@ class AutoencoderTrainer():
             gen_step_loss += generator_loss.item()
             disc_step_loss += discriminator_loss.item()
         
-        return step_loss, gen_step_loss, disc_step_loss, reconstruction
+        return step_loss, gen_step_loss, disc_step_loss
     
     def discriminator_step(self, reconstruction, images):
         self.optimizer_d.zero_grad(set_to_none=True)
@@ -168,6 +215,8 @@ class AutoencoderTrainer():
 
     def clean_up(self):
         self.optimizer_g.zero_grad(set_to_none=True)
+        self.optimizer_d.zero_grad(set_to_none=True)
+
         if self.discriminator is not None:
             del self.discriminator
         if self.loss_perceptual is not None:
@@ -182,12 +231,15 @@ class SegmentationAutoencoderTrainer(AutoencoderTrainer):
                  patch_discrim_config: dict,
                  auto_encoder_training_config: dict,
                  evaluation_intervall: float,
-                 WANDB_LOG_IMAGES: bool) -> None:
+                 WANDB_LOG_IMAGES: bool,
+                 starting_epoch=0,
+                 ) -> None:
         super().__init__(autoencoder,
                         train_loader, val_loader,
                         patch_discrim_config, auto_encoder_training_config,
                         evaluation_intervall, 
-                        WANDB_LOG_IMAGES)
+                        WANDB_LOG_IMAGES, 
+                        starting_epoch)
         
         # Traditional Percpetual loss does not make sense for a segmentation to segmentation task
         self.perceptual_weight = 0

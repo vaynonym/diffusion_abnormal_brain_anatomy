@@ -53,6 +53,12 @@ class AutoencoderEvaluator():
 
             log_image_to_wandb(image_for_logging, reconstruction_for_logging, f"{self.wandb_prefix}/reconstruction", self.WANDB_LOG_IMAGES,
                         conditioning_information=conditioning)
+    def visualize_batches(self, count):
+        for i, batch in enumerate(self.val_loader):
+            self.visualize_batch(batch)
+            if i >= count:
+                break
+
     
     def evaluate(self,
                          is_training=True):

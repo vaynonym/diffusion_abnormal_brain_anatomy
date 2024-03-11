@@ -25,6 +25,7 @@ from src.datasets import SyntheticLDM100K
 from src.diffusion import get_scale_factor, generate_and_log_sample_images
 from src.directory_management import DATA_DIRECTORY
 from src.trainer import SegmentationAutoencoderTrainer
+from src.evaluation import MaskAutoencoderEvaluator
 
 import torch.multiprocessing
 
@@ -151,8 +152,8 @@ LOGGER.info(f"Batch image shape: {sample_data['mask'].shape}")
 autoencoder = AutoencoderKL(**auto_encoder_config).to(device)
 
 # Try to load identically trained autoencoder if it already exists. Else train a new one.
-if not load_model_from_run_with_matching_config([auto_encoder_config, auto_encoder_training_config, patch_discrim_config],
-                                            ["auto_encoder_config", "auto_encoder_training_config", "patch_discrim_config"],
+if not load_model_from_run_with_matching_config([run_config, auto_encoder_config, auto_encoder_training_config, patch_discrim_config],
+                                            ["run_config", "auto_encoder_config", "auto_encoder_training_config", "patch_discrim_config"],
                                             project=project, entity=entity,
                                             model=autoencoder, artifact_name=AutoencoderKL.__name__,
                                             ):
@@ -161,9 +162,12 @@ if not load_model_from_run_with_matching_config([auto_encoder_config, auto_encod
                                  train_loader=train_loader, val_loader=valid_loader, 
                                  patch_discrim_config=patch_discrim_config, auto_encoder_training_config=auto_encoder_training_config,
                                  WANDB_LOG_IMAGES=WANDB_LOG_IMAGES,
-                                 evaluation_intervall=run_config["evaluation_intervall"])
-
-    autoencoder = trainer.train()
+                                 evaluation_intervall=run_config["evaluation_intervall"],
+                                 starting_epoch=0
+                                 )
+    
+    with Stopwatch("Training took: "):
+        autoencoder = trainer.train()
 
     # clean up fully
     del trainer
@@ -172,7 +176,11 @@ if not load_model_from_run_with_matching_config([auto_encoder_config, auto_encod
 else:
     LOGGER.info("Loaded existing autoencoder")
 
-#visualize_reconstructions(train_loader, autoencoder, 10)
+with Stopwatch("Evaluating Autoencoder took: "):
+    evaluator = MaskAutoencoderEvaluator(autoencoder=autoencoder, val_loader=valid_loader, wandb_prefix="autoencoder/evaluation")
+    evaluator.visualize_batches(5)
+    evaluator.evaluate()
+    del evaluator
 
 quit()
 
