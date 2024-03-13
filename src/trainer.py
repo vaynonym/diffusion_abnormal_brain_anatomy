@@ -18,15 +18,17 @@ from src.evaluation import evaluate_diffusion_model
 from src.diffusion import generate_and_log_sample_images
 from src.torch_setup import device
 from src.synthseg_masks import decode_one_hot, encode_one_hot
-from src.evaluation import AutoencoderEvaluator, MaskAutoencoderEvaluator
+from src.evaluation import AutoencoderEvaluator, MaskAutoencoderEvaluator, SegmentationMaskAutoencoderEvaluator, SpadeAutoencoderEvaluator
 from src.directory_management import MODEL_DIRECTORY
+from src.custom_autoencoders import IAutoencoder
+from torch import Tensor
 from typing import Tuple
 import os
 
 class AutoencoderTrainer():
 
     def __init__(self,
-                 autoencoder: AutoencoderKL,
+                 autoencoder: IAutoencoder,
                  train_loader: DataLoader,
                  val_loader: DataLoader,
                  patch_discrim_config: dict,
@@ -36,7 +38,7 @@ class AutoencoderTrainer():
                  starting_epoch=0,
                  ) -> None:
 
-        self.autoencoder : AutoencoderKL = autoencoder
+        self.autoencoder : IAutoencoder = autoencoder
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.wandb_prefix = "autoencoder/training"
@@ -73,8 +75,13 @@ class AutoencoderTrainer():
         kl_loss = 0.5 * torch.sum(z_mu.pow(2) + z_sigma.pow(2) - torch.log(z_sigma.pow(2)) - 1, dim=[1, 2, 3, 4])
         return torch.sum(kl_loss) / kl_loss.shape[0]
     
-    def get_input_from_batch(self, batch) -> Tuple[torch.Tensor, None]:
-        return (batch["image"].to(device), None)    
+    def get_input_from_batch(self, batch: dict) -> Tuple[Tensor, ...]:
+        return (batch["image"].to(device),)
+
+    # this is important to enable different input and output encodings as well as support additional network inputs
+    # like segmentation masks that are not relevant for losses or evaluation
+    def get_input_for_evaluation_from_batch(self, model_input: Tuple[Tensor, ...], batch: dict) -> Tensor:
+        return model_input[0]
 
     def train(self):
         wandb.define_metric(f"{self.wandb_prefix}/epoch")
@@ -149,20 +156,21 @@ class AutoencoderTrainer():
     def do_step(self, batch, epoch):
         (step_loss, gen_step_loss, disc_step_loss) = (0, 0, 0)
         
-        images, _ = self.get_input_from_batch(batch)
+        model_input = self.get_input_from_batch(batch)
+        ground_truth = self.get_input_for_evaluation_from_batch(model_input, batch)
 
         # Generator part
         self.optimizer_g.zero_grad(set_to_none=True)
-        reconstruction, z_mu, z_sigma = self.autoencoder(images)
+        reconstruction, z_mu, z_sigma = self.autoencoder(*model_input)
         
 
-        recons_loss = self.l1_loss(reconstruction.float(), images.float())
+        recons_loss = self.l1_loss(reconstruction.float(), ground_truth.float())
         loss_g = recons_loss
 
         loss_g += self.kl_weight * self.KL_loss(z_mu, z_sigma)
 
         if self.loss_perceptual is not None:
-            loss_g += self.perceptual_weight * self.loss_perceptual(reconstruction.float(), images.float())
+            loss_g += self.perceptual_weight * self.loss_perceptual(reconstruction.float(), ground_truth.float())
 
         # Adverserial loss determined by the discriminator
         if epoch >= self.autoencoder_warm_up_n_epochs:
@@ -175,7 +183,7 @@ class AutoencoderTrainer():
 
         if epoch >= self.autoencoder_warm_up_n_epochs:
             # Discriminator part
-            discriminator_loss = self.discriminator_step(reconstruction, images)
+            discriminator_loss = self.discriminator_step(reconstruction, ground_truth)
 
 
         step_loss += recons_loss.item()
@@ -185,12 +193,12 @@ class AutoencoderTrainer():
         
         return step_loss, gen_step_loss, disc_step_loss
     
-    def discriminator_step(self, reconstruction, images):
+    def discriminator_step(self, reconstruction, images_y):
         self.optimizer_d.zero_grad(set_to_none=True)
         
         logits_fake = self.discriminator(reconstruction.contiguous().detach())[-1]
         loss_d_fake = self.adv_loss(logits_fake, target_is_real=False, for_discriminator=True)
-        logits_real = self.discriminator(images.contiguous().detach())[-1]
+        logits_real = self.discriminator(images_y.contiguous().detach())[-1]
         loss_d_real = self.adv_loss(logits_real, target_is_real=True, for_discriminator=True)
         discriminator_loss = (loss_d_fake + loss_d_real) * 0.5
 
@@ -246,7 +254,32 @@ class SegmentationAutoencoderTrainer(AutoencoderTrainer):
         self.loss_perceptual = None
         self.evaluator = MaskAutoencoderEvaluator(self.autoencoder, self.val_loader, self.wandb_prefix)
 
-    
-    def get_input_from_batch(self, batch) -> Tuple[torch.Tensor, None]:
+    def get_input_from_batch(self, batch) -> Tuple[Tensor, ...]:
         mask = encode_one_hot(batch["mask"].to(device))
-        return (mask, None)
+        return (mask,)
+
+class SegmentationEmbeddingAutoencoderTrainer(SegmentationAutoencoderTrainer):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.evaluator = SegmentationMaskAutoencoderEvaluator(self.autoencoder, self.val_loader, self.wandb_prefix)
+
+    # since the embedding has to be part of the model, we give the raw mask 
+    def get_input_from_batch(self, batch) -> Tuple[Tensor, ...]:
+        return (batch["mask"].int().to(device),)
+    
+    # Our decoder should output one-hot encoding, thus we compute loss and other evaluation calculation
+    # using one-hot encoding
+    def get_input_for_evaluation_from_batch(self, model_input, batch) -> Tensor:
+        mask = encode_one_hot(model_input[0])
+        return mask
+
+class SpadeAutoencoderTrainer(AutoencoderTrainer):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.evaluator = SpadeAutoencoderEvaluator(self.autoencoder, self.val_loader, self.wandb_prefix)
+    
+    def get_input_from_batch(self, batch: dict) -> Tuple[Tensor, ...]:
+        return (batch["image"].to(device), encode_one_hot(batch["mask"].to(device)))
+    
+    def get_input_for_evaluation_from_batch(self, model_input: Tuple[Tensor, ...], batch: dict) -> Tensor:
+        return model_input[0] # use the same image as we used as input to model
