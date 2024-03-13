@@ -1,17 +1,17 @@
 run:
   batch_size: 2
   input_image_downsampling_factors: [2, 2, 2] # (160, 224, 160) ==>
-  input_image_crop_roi: [80,112,80]
-  evaluation_intervall: 0.05
+  input_image_crop_roi: [80, 112, 80]
+  evaluation_intervall: 0.1
   dataset: "LDM100K"
-  target_data: "mask"
-  dataset_size: 2500
+  dataset_size: 1000 # 6000
 
 auto_encoder: 
   spatial_dims: 3
-  in_channels: 64
-  out_channels: 33
-  latent_channels: 3
+  label_nc: 33
+  in_channels: 1
+  out_channels: 1
+  latent_channels: 6
   num_channels: [64,128,128]
   num_res_blocks: 2
   norm_num_groups: 32
@@ -20,7 +20,7 @@ auto_encoder:
   with_decoder_nonlocal_attn: False
 
 autoencoder_training: 
-  n_epochs: 40
+  n_epochs: 20
   learning_rate: 0.000025
   autoencoder_warm_up_n_epochs: 3
 
@@ -28,8 +28,8 @@ patch_discrim:
   spatial_dims: 3
   num_layers_d: 3
   num_channels: 64
-  in_channels: 33
-  out_channels: 33
+  in_channels: 1
+  out_channels: 1
 
 diffusion_model_unet: 
   spatial_dims: 3
@@ -46,5 +46,5 @@ diffusion_model_unet:
   cross_attention_dim: 1
 
 diffusion_model_unet_training:
-  n_epochs: 10
+  n_epochs: 30
   learning_rate: 0.00002
