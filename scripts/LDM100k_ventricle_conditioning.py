@@ -18,12 +18,11 @@ import numpy as np
 
 from src.util import load_wand_credentials, log_image_to_wandb, Stopwatch, read_config, visualize_reconstructions
 from src.model_util import save_model_as_artifact, load_model_from_run_with_matching_config, check_dimensions
-from src.training import train_autoencoder, train_diffusion_model
 from src.logging_util import LOGGER
 from src.datasets import SyntheticLDM100K
 from src.diffusion import get_scale_factor, generate_and_log_sample_images
 from src.directory_management import DATA_DIRECTORY
-from src.trainer import AutoencoderTrainer
+from src.trainer import AutoencoderTrainer, DiffusionModelTrainer
 
 import torch.multiprocessing
 
@@ -164,7 +163,6 @@ else:
 
 visualize_reconstructions(train_loader, autoencoder, 10)
 
-quit()
 
 unet = DiffusionModelUNet(**diffusion_model_unet_config).to(device)
 scheduler = DDPMScheduler(num_train_timesteps=1000, schedule="scaled_linear_beta", beta_start=0.0015, beta_end=0.0205, clip_sample=False)
@@ -178,17 +176,21 @@ optimizer_diff = torch.optim.Adam(params=unet.parameters(),
 scaler = GradScaler()
 
 LOGGER.info("Training new diffusion model...")
-with Stopwatch("Diffusion training took:"):
-    train_diffusion_model(autoencoder=autoencoder,
-                          unet=unet, 
-                          optimizer_diff=optimizer_diff, 
-                          scaler=scaler, 
-                          inferer=inferer, 
-                          train_loader=train_loader,
-                          valid_loader=valid_loader,
-                          encoding_shape=encoding_shape,
-                          n_epochs=diffusion_model_training_config["n_epochs"],
-                          evaluation_intervall=run_config["evaluation_intervall"])
+
+trainer = DiffusionModelTrainer(autoencoder=autoencoder,
+                      unet=unet, 
+                      optimizer_diff=optimizer_diff, 
+                      scaler=scaler, 
+                      inferer=inferer, 
+                      train_loader=train_loader,
+                      valid_loader=valid_loader,
+                      encoding_shape=encoding_shape,
+                      diffusion_model_training_config=diffusion_model_training_config,
+                      evaluation_intervall=run_config["evaluation_intervall"],
+                      starting_epoch=0
+                      )
+
+unet = trainer.train()
 
 LOGGER.info("Saving diffusion model as artifact")
 save_model_as_artifact(wandb_run, unet, type(unet).__name__, diffusion_model_unet_config)

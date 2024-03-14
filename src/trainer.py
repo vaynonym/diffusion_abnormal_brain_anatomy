@@ -283,3 +283,175 @@ class SpadeAutoencoderTrainer(AutoencoderTrainer):
     
     def get_input_for_evaluation_from_batch(self, model_input: Tuple[Tensor, ...], batch: dict) -> Tensor:
         return model_input[0] # use the same image as we used as input to model
+    
+
+########## DIFFUSION MODEL ###########
+
+class DiffusionModelTrainer(AutoencoderTrainer):
+    def __init__(self,
+                 autoencoder: IAutoencoder,
+                 unet: DiffusionModelUNet,
+                 optimizer_diff: torch.optim.Optimizer, scaler: GradScaler,
+                 inferer: LatentDiffusionInferer,
+                 train_loader: DataLoader, valid_loader: DataLoader,
+                 encoding_shape: torch.Size,
+                 diffusion_model_training_config: dict, 
+                 evaluation_intervall: float,
+                 starting_epoch=0,
+                ) -> None:
+        self.wandb_prefix = "diffusion/training"
+        wandb.define_metric(f"{self.wandb_prefix}/epoch")
+        wandb.define_metric(f"{self.wandb_prefix}/*", step_metric=f"{self.wandb_prefix}/epoch")
+
+        self.train_loader = train_loader
+        self.val_loader = valid_loader
+        self.encoding_shape = encoding_shape
+        self.evaluation_intervall= evaluation_intervall
+        self.inferer = inferer
+
+        # stateful
+        self.optimizer = optimizer_diff
+        self.grad_scaler = scaler
+        self.autoencoder = autoencoder
+        self.diffusion_model = unet
+
+        self.n_epochs = diffusion_model_training_config["n_epochs"]
+        
+        self.current_epoch = starting_epoch
+        assert self.current_epoch <= self.n_epochs
+
+        
+        # continue training from checkpoint
+        if self.current_epoch != 0:
+            self.load_state()
+
+    
+    def get_input_from_batch(self, batch: dict) -> dict:
+        return  { "inputs": batch["image"].to(device), 
+                  "condition": batch["volume"].to(device)
+                }
+    
+    def get_input_for_evaluation_from_batch(self, model_input: Tuple[Tensor, ...], batch: dict) -> Tensor:
+        return super().get_input_for_evaluation_from_batch(model_input, batch)
+    
+    def train(self):
+        train_stopwatch = Stopwatch("Training took: ").start()
+
+        for epoch in range(self.current_epoch, self.n_epochs):
+            self.autoencoder.eval()
+            self.diffusion_model.train()
+            
+            epoch_loss = 0
+
+            for step, batch in enumerate(self.train_loader):
+                epoch_loss += self.do_step(batch, epoch)
+            
+            self.log_epoch(step, epoch, epoch_loss)
+
+
+            if epoch + 1 in (np.round(np.arange(0.0, 1.01, self.evaluation_intervall) * self.n_epochs)):
+                with Stopwatch("Sampling example images took: "):
+                    generate_and_log_sample_images(autoencoder=self.autoencoder, 
+                                                   unet=self.diffusion_model, 
+                                                   scheduler=self.inferer.scheduler,
+                                                   encoding_shape=self.encoding_shape, 
+                                                   inferer=self.inferer,
+                                                   prefix_string=f"{self.wandb_prefix}/synthetic images")
+                
+                with Stopwatch("Generating metrics took: "):
+                    evaluate_diffusion_model(diffusion_model=self.diffusion_model,
+                                            scheduler=self.inferer.scheduler,
+                                            autoencoder=self.autoencoder,
+                                            latent_shape=self.encoding_shape,
+                                            inferer=self.inferer,
+                                            val_loader=self.val_loader,
+                                            )
+
+                with Stopwatch("Saving new state took: "):
+                    previously_saved_epoch = self.current_epoch
+                    self.current_epoch = epoch + 1
+                    self.save_state()
+                    self.delete_save(previously_saved_epoch)
+
+        # clean up data
+        self.clean_up()
+
+        train_stopwatch.stop().display()
+
+        return self.diffusion_model
+
+
+    def do_step(self, batch, epoch):
+        inputs = self.get_input_from_batch(batch)
+        self.optimizer.zero_grad(set_to_none=True)
+
+        with autocast(enabled=True):
+            # Generate random noise
+            noise = torch.randn(self.encoding_shape).to(device)
+            batch_size = self.encoding_shape[0]
+            # Create timesteps
+            timesteps = torch.randint(
+                0, self.inferer.scheduler.num_train_timesteps, (batch_size,), device=device
+            ).long()
+
+            # Get model prediction
+            noise_pred = self.inferer(
+                autoencoder_model=self.autoencoder, 
+                diffusion_model=self.diffusion_model, 
+                noise=noise,
+                timesteps=timesteps,
+                **inputs
+            )
+
+            loss = F.mse_loss(noise_pred.float(), noise.float())
+
+        self.grad_scaler.scale(loss).backward()
+        self.grad_scaler.step(self.optimizer)
+        self.grad_scaler.update()
+
+        return loss.item()
+
+        
+    def save_state(self):
+
+        state = {f"model_{self.autoencoder.__class__.__name__}": self.autoencoder.state_dict(),
+                 f"model_{self.diffusion_model.__class__.__name__}": self.diffusion_model.state_dict(),
+                 f"optimizer": self.optimizer.state_dict(),
+                 f"scaler": self.grad_scaler.state_dict()
+                 }
+        torch.save(state, os.path.join(MODEL_DIRECTORY, f"{self.__class__.__name__}_E{self.current_epoch}.pth"))
+    
+    def delete_save(self, epoch):
+        path = os.path.join(MODEL_DIRECTORY, f"{self.__class__.__name__}_E{epoch}.pth")
+        if os.path.exists(path):
+            os.remove(path)
+    
+    def load_state(self):
+        path = os.path.join(MODEL_DIRECTORY, f"{self.__class__.__name__}_E{self.current_epoch}.pth")
+        assert os.path.exists(path), f"Since starting epoch is not zero, expects state to exist at: {path}"
+
+        state = torch.load(path, map_location=device)
+
+        autoencoder_name = f"model_{self.autoencoder.__class__.__name__}"
+        assert autoencoder_name in state.keys(), f"Autoencoder with class {self.autoencoder.__class__.__name__} not present in saved state"
+
+        diffusion_name = f"model_{self.diffusion_model.__class__.__name__}"
+        assert diffusion_name in state.keys(), f"Diffusion model with class {self.diffusion_model.__class__.__name__} not present in saved state"
+
+        self.autoencoder.load_state_dict(state[autoencoder_name])
+        self.diffusion_model.load_state_dict(state[diffusion_name])
+        self.optimizer.load_state_dict(state["optimizer"])
+        self.grad_scaler.load_state_dict(state["scaler"])
+    
+    def log_epoch(self, step, epoch, epoch_loss):
+        LOGGER.info(f"{epoch}: loss={epoch_loss / (step + 1):.5f}")
+        wandb.log({ 
+                    f"{self.wandb_prefix}/epoch": epoch,
+                    f"{self.wandb_prefix}/loss": epoch_loss / (step + 1),
+                  })
+    
+    def clean_up(self):
+        self.optimizer.zero_grad(set_to_none=True)
+        del self.grad_scaler
+        del self.optimizer
+        torch.cuda.empty_cache()
