@@ -48,18 +48,25 @@ def log_image_with_mask(image: np.ndarray,
                                           }
              })
         
+        columns = [name, conditioning_information, input_image]
 
         if reconstruction_image is not None and reconstruction_mask is not None:
-            reconstruction_image = wandb.Image(
-                get_indices(image), 
+            side_image = wandb.Image(
+                get_indices(reconstruction_image), 
                 masks={ "reconstruction": {
                                             "mask_data": get_indices(reconstruction_mask),
                                             "class_labels": synthseg_class_to_string_map
                                           }
                       },
                 )
-        data.append([name, conditioning_information, input_image, reconstruction_image])
-    table = wandb.Table(columns=["type", "conditioning", "image", "reconstruction"], data=data)
+            columns.append(side_image)
+        data.append(columns)
+    
+    column_names = ["type", "conditioning", "image"]
+    if reconstruction_image is not None and reconstruction_mask is not None:
+        column_names.append("reconstruction")
+
+    table = wandb.Table(columns=column_names, data=data)
 
     wandb.log({description_prefix: table})
     

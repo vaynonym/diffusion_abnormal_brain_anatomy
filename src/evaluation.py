@@ -22,6 +22,10 @@ from src.torch_setup import device
 from src.util import log_image_with_mask, log_image_to_wandb
 from src.synthseg_masks import decode_one_hot, encode_one_hot
 from src.custom_autoencoders import IAutoencoder
+from itertools import combinations
+from torch.utils.data import RandomSampler, ConcatDataset
+
+
 
 class AutoencoderEvaluator():
 
@@ -70,7 +74,7 @@ class AutoencoderEvaluator():
 
     def evaluate(self):
         if self.val_loader is None:
-            print("Cannot evaluate without validation dataloader")
+            LOGGER.warn("Cannot evaluate without validation dataloader")
             return
 
         self.autoencoder.eval()
@@ -108,7 +112,7 @@ class AutoencoderEvaluator():
 
 class MaskAutoencoderEvaluator(AutoencoderEvaluator):
     def __init__(self, 
-                 autoencoder: AutoencoderKL,
+                 autoencoder: IAutoencoder,
                  val_loader: Optional[DataLoader],
                  wandb_prefix: str,
                  ) -> None:
@@ -131,9 +135,7 @@ class MaskAutoencoderEvaluator(AutoencoderEvaluator):
 
             model_input = self.get_input_from_batch(batch)
             reconstruction = self.autoencoder.reconstruct(*model_input)
-            print(reconstruction.shape)
-            print
-            
+
             # log intensity values
             wandb.log({f"{self.wandb_prefix}/max_r_intensity": reconstruction.max().item(),
                         f"{self.wandb_prefix}/min_r_intensity": reconstruction.min().item()})
@@ -149,7 +151,7 @@ class MaskAutoencoderEvaluator(AutoencoderEvaluator):
 
 
 class SegmentationMaskAutoencoderEvaluator(MaskAutoencoderEvaluator):
-    def __init__(self, autoencoder: AutoencoderKL, val_loader: Optional[DataLoader], wandb_prefix: str) -> None:
+    def __init__(self, autoencoder: IAutoencoder, val_loader: Optional[DataLoader], wandb_prefix: str) -> None:
         super().__init__(autoencoder, val_loader, wandb_prefix)
     
     def get_input_from_batch(self, batch) -> Tuple[Tensor, None]:
@@ -173,99 +175,269 @@ class SpadeAutoencoderEvaluator(AutoencoderEvaluator):
 
 ############### Diffusion Model Evaluation #####################
 
-def evaluate_diffusion_model(diffusion_model: nn.Module,
-                             scheduler,
-                             autoencoder: AutoencoderKL,
-                             latent_shape: Tensor,
-                             inferer: LatentDiffusionInferer,
-                             val_loader: DataLoader,
-                             get_input_from_batch = lambda batch: (batch["image"].to(device), batch["volume"].to(device))
-                             ):
-    weights_path = os.path.join(PRETRAINED_MODEL_DIRECTORY, "resnet_50.pth")
-    assert os.path.exists(weights_path)
+class DiffusionModelEvaluator():
+    def __init__(self, 
+                 diffusion_model: nn.Module,
+                 scheduler,
+                 autoencoder: IAutoencoder,
+                 latent_shape: torch.Size,
+                 inferer: LatentDiffusionInferer,
+                 val_loader: DataLoader,
+                 train_loader: DataLoader,
+                 wandb_prefix: str) -> None:
+        self.diffusion_model = diffusion_model
+        self.scheduler = scheduler
+        self.autoencoder = autoencoder
+        self.latent_shape = latent_shape
+        self.inferer = inferer
+        self.val_loader = val_loader
+        self.train_loader = train_loader
 
-    diffusion_model.eval()
+        self.wandb_prefix = wandb_prefix
 
-    feature_extraction_model = resnet50(pretrained=False,
-                                        shortcut_type="B",
-                                        feed_forward=False,
-                                        bias_downsample=False,
-                                        n_input_channels=1,
-                                        spatial_dims=3
-                                        ).to(device)
-    feature_extraction_model.eval()
+        self.load_feature_extraction_model()
+    
+    def load_feature_extraction_model(self):
+        weights_path = os.path.join(PRETRAINED_MODEL_DIRECTORY, "resnet_50.pth")
+        assert os.path.exists(weights_path)
 
-    loaded = torch.load(weights_path)
-    state_dict = loaded["state_dict"]
-    state_dict_without_data_parallel = OrderedDict()
-    prefix_len = len("module.")
-    for k, v in state_dict.items():
-        name = k[prefix_len:] # remove "module." prefix
-        state_dict_without_data_parallel[name] = v
+        self.feature_extraction_model = resnet50(pretrained=False,
+                                            shortcut_type="B",
+                                            feed_forward=False,
+                                            bias_downsample=False,
+                                            n_input_channels=1,
+                                            spatial_dims=3
+                                            ).to(device)
+        
+        # weights are from a model wrapped in torch.nn.DataParallel
+        # so we need to unwrap the weights to load them
+        loaded = torch.load(weights_path)
+        state_dict = loaded["state_dict"]
+        state_dict_without_data_parallel = OrderedDict()
+        prefix_len = len("module.")
+        for k, v in state_dict.items():
+            name = k[prefix_len:] # remove "module." prefix
+            state_dict_without_data_parallel[name] = v
 
-    feature_extraction_model.load_state_dict(state_dict_without_data_parallel)
-
-    def medicalNetNormalize(img):
+        self.feature_extraction_model.load_state_dict(state_dict_without_data_parallel)
+    
+    def medicalNetNormalize(self, img):
         return nn.functional.interpolate(
             (img - img.mean(dim=(1,2,3,4), keepdim=True)) / img.std(dim=(1,2,3,4), keepdim=True),
             size=(125, 125, 125), mode="trilinear"
             )
     
-    synth_features = []
-    real_features = []
-    losses = []
-
-    # get latent representations of all real data (for FID)
-    with Stopwatch("Getting real features took: "):
-        for i, batch in enumerate(val_loader):
-            real_images, _ = get_input_from_batch(batch)
-            with torch.no_grad():
-                normalized = medicalNetNormalize(real_images)
-                if i < 2:
-                    log_image_to_wandb(real_images[0, 0].detach().cpu().numpy(), None, "MedicalnetNormalize/pristine", True, None, None)
-                    log_image_to_wandb(real_images[1, 0].detach().cpu().numpy(), None, "MedicalnetNormalize/pristine", True, None, None)
-
-                    log_image_to_wandb(normalized[0, 0].detach().cpu().numpy(), None, "MedicalnetNormalize/normalized", True, None, None)
-                    log_image_to_wandb(normalized[1, 0].detach().cpu().numpy(), None, "MedicalnetNormalize/normalized", True, None, None)
-
-                real_eval_feats : Tensor = feature_extraction_model(normalized)
-                real_features.append(real_eval_feats)
-
-    # calculate validation loss for sample
-    # get latent representations of synthetic images (for FID)
-    number_images_to_consider = 20
-    for _, batch in enumerate(val_loader):
-        # Get the real images
-        real_images, conditioning = get_input_from_batch(batch)
-
-        # Generate some synthetic images using the defined model
-        latent_noise = torch.randn(latent_shape).to(device)
-        scheduler.set_timesteps(num_inference_steps=1000)
-
-        with torch.no_grad():
-            # Generating images far dominates the time to extract features
-            syn_images = inferer.sample(input_noise=latent_noise, autoencoder_model=autoencoder, diffusion_model=diffusion_model, scheduler=scheduler, conditioning=conditioning)
-            syn_images = torch.clamp(syn_images, 0., 1.)
-
-            losses.append(F.mse_loss(syn_images.float(), real_images.float()).detach())
-            syn_images = medicalNetNormalize(syn_images)
-
-            # Get the features for the synthetic data
-            synth_eval_feats = feature_extraction_model(syn_images)
-            synth_features.append(synth_eval_feats)
-        
-        batch_size = synth_features[0].shape[0]
-        
-        if len(synth_features) * batch_size >= number_images_to_consider:
-            break
-
-    synth_features = torch.vstack(synth_features)
-    real_features = torch.vstack(real_features)
-    mean_loss = torch.stack(losses).mean()
-
-    fid = FIDMetric()
-    fid_res = fid(synth_features, real_features)
-    wandb.log({"diffusion/training/FID": fid_res.item(),
-               "diffusion/training/valid_loss": mean_loss.item()})
+    def get_input_from_batch(self, batch):
+        return (batch["image"].to(device), batch["volume"].to(device))
     
-    print(f"FID Score: {fid_res.item():.4f}")
+    def get_real_features(self, dataloader: DataLoader):
+        real_features = []
+        for i, batch in enumerate(dataloader):
+            real_images, _ = self.get_input_from_batch(batch)
+            with torch.no_grad():
+                
+                normalized = self.medicalNetNormalize(torch.clamp(real_images, 0., 1.))
+                #if i < 2:
+                #    log_image_to_wandb(real_images[0, 0].detach().cpu().numpy(), None, "MedicalnetNormalize/pristine", True, None, None)
+                #    log_image_to_wandb(real_images[1, 0].detach().cpu().numpy(), None, "MedicalnetNormalize/pristine", True, None, None)
+                #
+                #    log_image_to_wandb(normalized[0, 0].detach().cpu().numpy(), None, "MedicalnetNormalize/normalized", True, None, None)
+                #    log_image_to_wandb(normalized[1, 0].detach().cpu().numpy(), None, "MedicalnetNormalize/normalized", True, None, None)
+
+                real_eval_feats : Tensor = self.feature_extraction_model(normalized)
+                real_features.append(real_eval_feats)
+        
+        return torch.vstack(real_features)
+    
+    def get_additional_input_from_batch(self, batch) -> dict:
+        return {"conditioning": batch["volume"].to(device)}
+    
+    def get_synthetic_images(self, batch):
+        latent_noise = torch.randn(self.latent_shape).to(device)    
+        additional_inputs = self.get_additional_input_from_batch(batch)
+        return self.inferer.sample(input_noise=latent_noise,
+                                   autoencoder_model=self.autoencoder,
+                                   diffusion_model=self.diffusion_model,
+                                   scheduler=self.scheduler, 
+                                   **additional_inputs)
+    
+    def get_synthetic_features(self, count):
+        batch_size = self.latent_shape[0]
+        synth_features = []
+
+        for i, batch in enumerate(self.train_loader):
+            # Get the real images
+            self.scheduler.set_timesteps(num_inference_steps=1000)
+
+            # Generate some synthetic images using the defined model
+            synthetic_images=self.get_synthetic_images(batch)
+
+            with torch.no_grad():
+                synthetic_images = self.medicalNetNormalize(torch.clamp(synthetic_images, 0., 1.))
+
+                # Get the features for the synthetic data
+                # Generating images far dominates the time to extract features
+                synth_eval_feats = self.feature_extraction_model(synthetic_images)
+                synth_features.append(synth_eval_feats)
+            
+            if (i + 1) * batch_size >= count:
+                break
+
+        return torch.vstack(synth_features)
+    
+
+    def calculate_diversity_metrics(self, count):
+
+        batch_size_multiplier = 3
+
+        combined_dataset = ConcatDataset([self.train_loader.dataset, self.val_loader.dataset])
+        combined_dataloader = DataLoader(
+                   dataset=combined_dataset,
+                   batch_size=self.train_loader.batch_size * batch_size_multiplier,
+                   shuffle=False,
+                   drop_last=self.train_loader.drop_last, 
+                   num_workers=self.train_loader.num_workers,
+                   persistent_workers=self.train_loader.persistent_workers,
+                   sampler=RandomSampler(combined_dataset, replacement=True, num_samples=count)
+                   )
+        
+        old_latent_shape = self.latent_shape
+        # temporarily double batch size
+        self.latent_shape = torch.Size([self.latent_shape[0] * batch_size_multiplier, *self.latent_shape[1:]])
+
+        metrics = [
+        ("MS-SSIM", MultiScaleSSIMMetric(spatial_dims=3, data_range=1.0, kernel_size=4), []),
+        ("SSIM", SSIMMetric(spatial_dims=3, data_range=1.0, kernel_size=4), []),
+        ("MMD", MMDMetric(), []),
+        ]
+
+        current_count = 0
+        for i, batch in enumerate(combined_dataloader):
+            # Get the real images
+            self.scheduler.set_timesteps(num_inference_steps=1000)
+
+            # Generate some synthetic images using the defined model
+            synthetic_images=self.get_synthetic_images(batch)
+            
+            combinations_in_batch = list(combinations(range(self.latent_shape[0]), 2))
+            for idx_a, idx_b in combinations_in_batch:
+                for _, metric, scores in metrics:
+                    res = metric(synthetic_images[idx_a].unsqueeze(0), 
+                                 synthetic_images[idx_b].unsqueeze(0))
+                    if(len(res.size()) == 0):
+                        res = res.unsqueeze(0)
+                    scores.append(res)
+                
+                current_count += 1
+
+                if current_count >= count:
+                    break
+            
+            if current_count >= count:
+                break
+        
+        LOGGER.info(f"Number of batches for diversity metrics: { i + 1}")
+
+        results = {
+            f"{self.wandb_prefix}/{name}": torch.cat(scores, dim=0).mean().item() for name, _, scores in metrics
+        }
+
+        # return batch size to original value
+        self.latent_shape = old_latent_shape
+
+        return results
+
+
+    
+    # fid is calculated on train dataset
+    def calculate_fid(self):
+        real_features = self.get_real_features(self.train_loader)
+        synthetic_features = self.get_synthetic_features(4)
+
+        fid = FIDMetric()(synthetic_features, real_features)
+        return fid
+    
+    def evaluate(self):
+        with torch.no_grad():
+            self.autoencoder.eval()
+            self.diffusion_model.eval()
+            fid = self.calculate_fid()
+            results = {f"{self.wandb_prefix}/FID": fid.item()}
+            diversity_metrics = self.calculate_diversity_metrics(15)
+
+        results.update(diversity_metrics)
+        wandb.log(results)
+    
+    def log_samples(self, count):
+        self.autoencoder.eval()
+        self.diffusion_model.eval()
+
+        batch_size = self.latent_shape[0]
+        for i, batch in enumerate(self.val_loader):
+            self.scheduler.set_timesteps(num_inference_steps=1000)
+
+            synthetic_images = self.get_synthetic_images(batch)
+            additional_inputs = self.get_additional_input_from_batch(batch)
+
+            # ### Visualise synthetic data
+            for batch_index in range(batch_size):
+                img = synthetic_images[batch_index, 0].detach().cpu().numpy()  # images
+
+                if "conditioning" in additional_inputs.keys():
+                    conditioning = additional_inputs["conditioning"]
+                else:
+                    conditioning = None
+                
+                log_image_to_wandb(img, None, f"{self.wandb_prefix}/sample_images", True, conditioning[batch_index, 0].detach().cpu())
+
+                if (i + 1) * batch_size + (batch_index + 1) >= count:
+                    break
+            
+            if (i + 1) * batch_size >= count:
+                break
+
+class SpadeDiffusionModelEvaluator(DiffusionModelEvaluator):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+
+    def get_additional_input_from_batch(self, batch) -> dict:
+        return {"seg": encode_one_hot(batch["mask"].to(device))}
+    
+    def log_samples(self, count):
+        self.autoencoder.eval()
+        self.diffusion_model.eval()
+
+        batch_size = self.latent_shape[0]
+        for i, batch in enumerate(self.val_loader):
+            input_noise =  torch.randn(self.latent_shape).to(device)
+            additional_inputs = self.get_additional_input_from_batch(batch)
+
+            self.scheduler.set_timesteps(num_inference_steps=1000)
+            
+            synthetic_images = self.inferer.sample(
+                                            input_noise=input_noise,
+                                            autoencoder_model=self.autoencoder,
+                                            diffusion_model=self.diffusion_model,
+                                            scheduler=self.scheduler,
+                                            **additional_inputs
+                                            )
+
+            # ### Visualise synthetic data
+            for batch_index in range(batch_size):
+                synth_image = synthetic_images[batch_index, 0].detach().cpu().numpy()  # images
+                original_image = batch["image"][batch_index, 0].detach().cpu().numpy()
+                mask = batch["mask"][batch_index, 0].detach().cpu().numpy()
+                
+                log_image_with_mask(image=original_image, 
+                                    original_mask=mask, 
+                                    reconstruction_image=synth_image,
+                                    reconstruction_mask=mask,
+                                    description_prefix=f"{self.wandb_prefix}/sample_images",
+                                    conditioning_information=None)
+                
+                if (i + 1) * batch_size + (batch_index + 1) >= count:
+                    break
+                
+            
+            if (i + 1) * batch_size >= count:
+                break

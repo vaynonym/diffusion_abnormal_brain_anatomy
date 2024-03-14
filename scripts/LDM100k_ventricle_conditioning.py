@@ -20,7 +20,7 @@ from src.util import load_wand_credentials, log_image_to_wandb, Stopwatch, read_
 from src.model_util import save_model_as_artifact, load_model_from_run_with_matching_config, check_dimensions
 from src.logging_util import LOGGER
 from src.datasets import SyntheticLDM100K
-from src.diffusion import get_scale_factor, generate_and_log_sample_images
+from src.diffusion import get_scale_factor
 from src.directory_management import DATA_DIRECTORY
 from src.trainer import AutoencoderTrainer, DiffusionModelTrainer
 
@@ -140,8 +140,8 @@ LOGGER.info(f"Batch image shape: {sample_data['image'].shape}")
 autoencoder = AutoencoderKL(**auto_encoder_config).to(device)
 
 # Try to load identically trained autoencoder if it already exists. Else train a new one.
-if not load_model_from_run_with_matching_config([auto_encoder_config, auto_encoder_training_config, patch_discrim_config],
-                                            ["auto_encoder_config", "auto_encoder_training_config", "patch_discrim_config"],
+if not load_model_from_run_with_matching_config([auto_encoder_config, auto_encoder_training_config],
+                                            ["auto_encoder_config", "auto_encoder_training_config"],
                                             project=project, entity=entity, 
                                             model=autoencoder, artifact_name=AutoencoderKL.__name__,
                                             ):
@@ -195,12 +195,5 @@ unet = trainer.train()
 LOGGER.info("Saving diffusion model as artifact")
 save_model_as_artifact(wandb_run, unet, type(unet).__name__, diffusion_model_unet_config)
 
-LOGGER.info("Sampling from trained diffusion model...")
-for i in range(5):
-    generate_and_log_sample_images( autoencoder=autoencoder, unet=unet, 
-                                    scheduler=scheduler,
-                                    encoding_shape=encoding_shape, 
-                                    inferer=inferer,
-                                    prefix_string="diffusion/synthetic images")
 
 wandb.finish()

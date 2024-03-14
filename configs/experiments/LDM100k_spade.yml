@@ -2,9 +2,9 @@ run:
   batch_size: 2
   input_image_downsampling_factors: [2, 2, 2] # (160, 224, 160) ==>
   input_image_crop_roi: [80, 112, 80]
-  evaluation_intervall: 0.1
+  evaluation_intervall: 0.05
   dataset: "LDM100K"
-  dataset_size: 1000 # 6000
+  dataset_size: 6000 # 6000
 
 auto_encoder: 
   spatial_dims: 3
@@ -33,8 +33,8 @@ patch_discrim:
 
 diffusion_model_unet: 
   spatial_dims: 3
-  in_channels: 3
-  out_channels: 3
+  in_channels: 6
+  out_channels: 6
   num_res_blocks: 2
   num_channels: [128, 256, 512]
   attention_levels: [False, True, True]
@@ -42,8 +42,10 @@ diffusion_model_unet:
   norm_num_groups: 32
   upcast_attention: True
   resblock_updown: True
-  with_conditioning: True
-  cross_attention_dim: 1
+  with_conditioning: False
+  cross_attention_dim: null
+  label_nc: 33
+
 
 diffusion_model_unet_training:
   n_epochs: 30

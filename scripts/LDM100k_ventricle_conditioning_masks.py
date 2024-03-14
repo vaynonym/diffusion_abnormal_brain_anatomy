@@ -2,7 +2,6 @@
 
 # Set up imports
 import os
-os.environ["CUDA_LAUNCH_BLOCKING"]= "1"
 import torch
 import torch.nn.functional as F
 from monai import transforms
@@ -22,10 +21,12 @@ from src.model_util import save_model_as_artifact, load_model_from_run_with_matc
 from src.training import train_diffusion_model
 from src.logging_util import LOGGER
 from src.datasets import SyntheticLDM100K
-from src.diffusion import get_scale_factor, generate_and_log_sample_images
+from src.diffusion import get_scale_factor
 from src.directory_management import DATA_DIRECTORY
-from src.trainer import SegmentationAutoencoderTrainer
-from src.evaluation import MaskAutoencoderEvaluator
+from src.trainer import SegmentationAutoencoderTrainer, SegmentationEmbeddingAutoencoderTrainer
+from src.evaluation import MaskAutoencoderEvaluator, SegmentationMaskAutoencoderEvaluator
+from src.custom_autoencoders import EmbeddingWrapper
+from src.synthseg_masks import synthseg_classes
 
 import torch.multiprocessing
 
@@ -122,7 +123,7 @@ validation_ds = SyntheticLDM100K(
 
 
 train_loader = DataLoader(train_ds, batch_size=run_config["batch_size"], shuffle=True, num_workers=4, drop_last=True, persistent_workers=True)
-valid_loader = DataLoader(validation_ds, batch_size=run_config["batch_size"], shuffle=True, num_workers=6, drop_last=True, persistent_workers=True)
+valid_loader = DataLoader(validation_ds, batch_size=run_config["batch_size"], shuffle=True, num_workers=4, drop_last=True, persistent_workers=True)
 
 dataset_preparation_stopwatch.stop().display()
 
@@ -149,16 +150,17 @@ for i in range(3):
 
 LOGGER.info(f"Batch image shape: {sample_data['mask'].shape}")
 
-autoencoder = AutoencoderKL(**auto_encoder_config).to(device)
+base_autoencoder = AutoencoderKL(**auto_encoder_config).to(device)
+autoencoder = EmbeddingWrapper(base_autoencoder=base_autoencoder, vocabulary_size=max(synthseg_classes) + 1, embedding_dim=64)
 
 # Try to load identically trained autoencoder if it already exists. Else train a new one.
 if not load_model_from_run_with_matching_config([run_config, auto_encoder_config, auto_encoder_training_config, patch_discrim_config],
                                             ["run_config", "auto_encoder_config", "auto_encoder_training_config", "patch_discrim_config"],
                                             project=project, entity=entity,
-                                            model=autoencoder, artifact_name=AutoencoderKL.__name__,
+                                            model=autoencoder, artifact_name=autoencoder.__class__.__name__,
                                             ):
     LOGGER.info("Training new autoencoder...")
-    trainer = SegmentationAutoencoderTrainer(autoencoder=autoencoder, 
+    trainer = SegmentationEmbeddingAutoencoderTrainer(autoencoder=autoencoder, 
                                  train_loader=train_loader, val_loader=valid_loader, 
                                  patch_discrim_config=patch_discrim_config, auto_encoder_training_config=auto_encoder_training_config,
                                  WANDB_LOG_IMAGES=WANDB_LOG_IMAGES,
@@ -177,7 +179,7 @@ else:
     LOGGER.info("Loaded existing autoencoder")
 
 with Stopwatch("Evaluating Autoencoder took: "):
-    evaluator = MaskAutoencoderEvaluator(autoencoder=autoencoder, val_loader=valid_loader, wandb_prefix="autoencoder/evaluation")
+    evaluator = SegmentationMaskAutoencoderEvaluator(autoencoder=autoencoder, val_loader=valid_loader, wandb_prefix="autoencoder/evaluation")
     evaluator.visualize_batches(5)
     evaluator.evaluate()
     del evaluator
@@ -212,11 +214,6 @@ LOGGER.info("Saving diffusion model as artifact")
 save_model_as_artifact(wandb_run, unet, type(unet).__name__, diffusion_model_unet_config)
 
 LOGGER.info("Sampling from trained diffusion model...")
-for i in range(5):
-    generate_and_log_sample_images( autoencoder=autoencoder, unet=unet, 
-                                    scheduler=scheduler,
-                                    encoding_shape=encoding_shape, 
-                                    inferer=inferer,
-                                    prefix_string="diffusion/synthetic images")
+
 
 wandb.finish()

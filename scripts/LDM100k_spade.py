@@ -18,14 +18,12 @@ import numpy as np
 
 from src.util import load_wand_credentials, log_image_to_wandb, Stopwatch, read_config, visualize_reconstructions, log_image_with_mask
 from src.model_util import save_model_as_artifact, load_model_from_run_with_matching_config, check_dimensions
-from src.training import train_diffusion_model
 from src.logging_util import LOGGER
 from src.datasets import SyntheticLDM100K
-from src.diffusion import get_scale_factor, generate_and_log_sample_images
+from src.diffusion import get_scale_factor
 from src.directory_management import DATA_DIRECTORY
-from src.trainer import SpadeAutoencoderTrainer
-from src.evaluation import SpadeAutoencoderEvaluator
-from src.custom_autoencoders import EmbeddingWrapper
+from src.trainer import SpadeAutoencoderTrainer, SpadeDiffusionModelTrainer, DiffusionModelTrainer
+from src.evaluation import SpadeAutoencoderEvaluator, SpadeDiffusionModelEvaluator
 from src.synthseg_masks import synthseg_classes
 
 import torch.multiprocessing
@@ -139,7 +137,7 @@ LOGGER.info(f"Encoding shape: {encoding_shape}")
 # ### Visualise examples from the training set
 iterator = enumerate(train_loader)
 sample_data = None # reused later
-for i in range(3):
+for i in range(1):
     _, sample_data = next(iterator)
     sample_index = 0
     mask = sample_data["mask"][sample_index, 0].detach().cpu().numpy()
@@ -151,8 +149,8 @@ LOGGER.info(f"Batch image shape: {sample_data['mask'].shape}")
 
 autoencoder = SPADEAutoencoderKL(**auto_encoder_config).to(device)
 
-if not load_model_from_run_with_matching_config([run_config, auto_encoder_config, auto_encoder_training_config, patch_discrim_config],
-                                            ["run_config", "auto_encoder_config", "auto_encoder_training_config", "patch_discrim_config"],
+if not load_model_from_run_with_matching_config([auto_encoder_config, auto_encoder_training_config, patch_discrim_config],
+                                            ["auto_encoder_config", "auto_encoder_training_config", "patch_discrim_config"],
                                             project=project, entity=entity,
                                             model=autoencoder, artifact_name=autoencoder.__class__.__name__,
                                             ):
@@ -181,4 +179,57 @@ with Stopwatch("Evaluating Autoencoder took: "):
     evaluator.evaluate()
     del evaluator
 
-quit()
+diffusion_model = SPADEDiffusionModelUNet(**diffusion_model_unet_config).to(device)
+scheduler = DDPMScheduler(num_train_timesteps=1000, schedule="scaled_linear_beta", beta_start=0.0015, beta_end=0.0205, clip_sample=False)
+
+# We define the inferer using the scale factor:
+scale_factor = get_scale_factor(autoencoder=autoencoder, sample_data=sample_data["image"].to(device))
+inferer = LatentDiffusionInferer(scheduler, scale_factor=scale_factor)
+
+
+# this should perhaps include also the autoencoder configs
+if not load_model_from_run_with_matching_config([diffusion_model_unet_config, diffusion_model_training_config],
+                                                ["diffusion_model_unet_config", "diffusion_model_training_config"],
+                                                project=project, entity=entity,
+                                                model=diffusion_model, 
+                                                artifact_name=diffusion_model.__class__.__name__,
+                                            ):
+    LOGGER.info("Training new Diffusion Model...")
+    optimizer_diff = torch.optim.Adam(params=diffusion_model.parameters(), 
+                                      lr=diffusion_model_training_config["learning_rate"])
+    grad_scaler = GradScaler()
+    trainer = SpadeDiffusionModelTrainer(
+        train_loader=train_loader, valid_loader=valid_loader, 
+        autoencoder=autoencoder,
+        unet=diffusion_model,
+        optimizer_diff=optimizer_diff,
+        scaler=grad_scaler,
+        inferer=inferer,
+        encoding_shape=encoding_shape,
+        diffusion_model_training_config=diffusion_model_training_config,
+        evaluation_intervall=run_config["evaluation_intervall"],
+    )
+    
+    with Stopwatch("Training took: "):
+        diffusion_model = trainer.train()
+
+    # clean up fully
+    del trainer
+    del optimizer_diff
+    del grad_scaler
+
+    save_model_as_artifact(wandb_run, diffusion_model, type(diffusion_model).__name__, auto_encoder_config)
+else:
+    LOGGER.info("Loaded existing diffusion model")
+
+evaluator = SpadeDiffusionModelEvaluator(
+                 diffusion_model=diffusion_model,
+                 scheduler=scheduler,
+                 autoencoder=scheduler,
+                 latent_shape=encoding_shape,
+                 inferer=inferer,
+                 val_loader=valid_loader,
+                 train_loader=train_loader,
+                 wandb_prefix="diffusion/evaluation")
+
+evaluator.log_samples(10)

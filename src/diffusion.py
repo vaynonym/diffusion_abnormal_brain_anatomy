@@ -27,29 +27,3 @@ def get_scale_factor(autoencoder: AutoencoderKL, sample_data: torch.Tensor) -> t
             scale_factor = 1 / torch.std(z)
             LOGGER.info(f"Scaling factor set to {scale_factor}")
     return scale_factor
-
-def generate_and_log_sample_images(autoencoder: AutoencoderKL,
-                                   unet: DiffusionModelUNet,
-                                   scheduler: DDPMScheduler,
-                                   inferer: LatentDiffusionInferer,
-                                   encoding_shape: torch.Size,
-                                   prefix_string: str):
-    autoencoder.eval()
-    unet.eval()
-
-    batch_size = encoding_shape[0]
-    conditioning = torch.rand(batch_size, 1, 1).to(device)
-    latent_noise = torch.randn(encoding_shape).to(device)
-
-    scheduler.set_timesteps(num_inference_steps=1000)
-    
-    synthetic_images = inferer.sample(input_noise=latent_noise,
-                                      autoencoder_model=autoencoder,
-                                      diffusion_model=unet,
-                                      scheduler=scheduler,
-                                      conditioning=conditioning)
-
-    # ### Visualise synthetic data
-    for batch_index in range(batch_size):
-        img = synthetic_images[batch_index, 0].detach().cpu().numpy()  # images
-        log_image_to_wandb(img, None, prefix_string, True, conditioning[batch_index, 0].detach().cpu())

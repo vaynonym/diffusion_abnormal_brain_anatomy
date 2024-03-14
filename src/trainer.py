@@ -11,14 +11,13 @@ from generative.losses import PatchAdversarialLoss, PerceptualLoss
 from generative.networks.nets import AutoencoderKL, DiffusionModelUNet, PatchDiscriminator
 from generative.inferers import LatentDiffusionInferer
 
-from src.util import Stopwatch, log_image_to_wandb, log_image_with_mask
-from src.model_util import save_model
+from src.util import Stopwatch
 from src.logging_util import LOGGER
-from src.evaluation import evaluate_diffusion_model
-from src.diffusion import generate_and_log_sample_images
+from src.evaluation import DiffusionModelEvaluator
 from src.torch_setup import device
 from src.synthseg_masks import decode_one_hot, encode_one_hot
-from src.evaluation import AutoencoderEvaluator, MaskAutoencoderEvaluator, SegmentationMaskAutoencoderEvaluator, SpadeAutoencoderEvaluator
+from src.evaluation import AutoencoderEvaluator, MaskAutoencoderEvaluator, SegmentationMaskAutoencoderEvaluator
+from src.evaluation import SpadeAutoencoderEvaluator, SpadeDiffusionModelEvaluator
 from src.directory_management import MODEL_DIRECTORY
 from src.custom_autoencoders import IAutoencoder
 from torch import Tensor
@@ -287,7 +286,7 @@ class SpadeAutoencoderTrainer(AutoencoderTrainer):
 
 ########## DIFFUSION MODEL ###########
 
-class DiffusionModelTrainer(AutoencoderTrainer):
+class DiffusionModelTrainer():
     def __init__(self,
                  autoencoder: IAutoencoder,
                  unet: DiffusionModelUNet,
@@ -324,6 +323,11 @@ class DiffusionModelTrainer(AutoencoderTrainer):
         # continue training from checkpoint
         if self.current_epoch != 0:
             self.load_state()
+        
+        self.evaluator = DiffusionModelEvaluator(self.diffusion_model, self.inferer.scheduler, self.autoencoder,
+                                                 self.encoding_shape, self.inferer, self.val_loader, self.train_loader,
+                                                 wandb_prefix=self.wandb_prefix
+                                                 )
 
     
     def get_input_from_batch(self, batch: dict) -> dict:
@@ -332,7 +336,7 @@ class DiffusionModelTrainer(AutoencoderTrainer):
                 }
     
     def get_input_for_evaluation_from_batch(self, model_input: Tuple[Tensor, ...], batch: dict) -> Tensor:
-        return super().get_input_for_evaluation_from_batch(model_input, batch)
+        return model_input["inputs"]
     
     def train(self):
         train_stopwatch = Stopwatch("Training took: ").start()
@@ -351,21 +355,10 @@ class DiffusionModelTrainer(AutoencoderTrainer):
 
             if epoch + 1 in (np.round(np.arange(0.0, 1.01, self.evaluation_intervall) * self.n_epochs)):
                 with Stopwatch("Sampling example images took: "):
-                    generate_and_log_sample_images(autoencoder=self.autoencoder, 
-                                                   unet=self.diffusion_model, 
-                                                   scheduler=self.inferer.scheduler,
-                                                   encoding_shape=self.encoding_shape, 
-                                                   inferer=self.inferer,
-                                                   prefix_string=f"{self.wandb_prefix}/synthetic images")
+                    self.evaluator.log_samples(1)
                 
-                with Stopwatch("Generating metrics took: "):
-                    evaluate_diffusion_model(diffusion_model=self.diffusion_model,
-                                            scheduler=self.inferer.scheduler,
-                                            autoencoder=self.autoencoder,
-                                            latent_shape=self.encoding_shape,
-                                            inferer=self.inferer,
-                                            val_loader=self.val_loader,
-                                            )
+                with Stopwatch("Evaluation metrics took: "):
+                    self.evaluator.evaluate()
 
                 with Stopwatch("Saving new state took: "):
                     previously_saved_epoch = self.current_epoch
@@ -455,3 +448,19 @@ class DiffusionModelTrainer(AutoencoderTrainer):
         del self.grad_scaler
         del self.optimizer
         torch.cuda.empty_cache()
+
+class SpadeDiffusionModelTrainer(DiffusionModelTrainer):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.evaluator = SpadeDiffusionModelEvaluator(
+                            self.diffusion_model, self.inferer.scheduler, self.autoencoder,
+                            self.encoding_shape, self.inferer,
+                            self.val_loader, self.train_loader,
+                            wandb_prefix=self.wandb_prefix
+                            )
+    
+    def get_input_from_batch(self, batch: dict) -> dict:
+        return  { 
+                  "inputs": batch["image"].to(device), 
+                  "seg": encode_one_hot(batch["mask"].to(device))
+                }
