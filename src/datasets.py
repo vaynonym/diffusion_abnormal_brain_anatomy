@@ -10,7 +10,9 @@ VENTRICLE_KEYS = [
     "left lateral ventricle",
     "left inferior lateral ventricle",
     "right lateral ventricle",
-    "right inferior lateral ventricle"
+    "right inferior lateral ventricle",
+    "3rd ventricle",
+    "4th ventricle",
 ]
     
 BRAIN_SIZE_KEY = "total intracranial"
