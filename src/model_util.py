@@ -17,6 +17,7 @@ def save_model_as_artifact(wandb_run, model: torch.nn.Module, model_name: str, m
     save_model(model, file_path)
     model_artifact.add_file(file_path)
     wandb_run.log_artifact(model_artifact)
+    LOGGER.info(f"Saved artifact {model_name}")
 
 def load_model(model: torch.nn.Module, path: str, optimizer: torch.optim.Optimizer=None):
     state = torch.load(path, map_location=torch.device('cpu'))
@@ -64,6 +65,9 @@ def load_model_from_run_with_matching_config(subconfigs, subconfig_names, projec
 
     load_model(model, downloaded_file_path)
     os.remove(downloaded_file_path)
+
+    # have wandb show connection between runs
+    wandb.use_artifact(fitting_artifact.name)
 
     return model
 
