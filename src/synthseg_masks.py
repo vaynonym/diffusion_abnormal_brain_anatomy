@@ -27,6 +27,50 @@ def reduce_mask_to_ventricles(mask: Tensor, device=device):
 
     return torch.isin(mask, ventricle_indices)
 
+def get_max_ventricle_crop(dataloader):
+    (i, first) : Tuple[int, Tensor] = next(enumerate(dataloader))
+    mask : Tensor = first["mask"]
+    assert len(list(mask.shape)) == 5
+    shape = mask.shape
+    max_x, max_y, max_z  = tuple(shape[2:] // 2)
+    min_x, min_y, min_z  = tuple(shape[2:] // 2)
+    del mask
+    
+    for _, batch in enumerate(dataloader):
+        ventricle_mask = reduce_mask_to_ventricles(batch["mask"])
+        ventricle_indices = ventricle_mask.nonzero()
+
+        local_max_x = torch.max(ventricle_indices[:, 2]).item()
+        local_min_x = torch.min(ventricle_indices[:, 2]).item()
+        local_max_y = torch.max(ventricle_indices[:, 3]).item()
+        local_min_y = torch.min(ventricle_indices[:, 3]).item()
+        local_max_z = torch.max(ventricle_indices[:, 4]).item()
+        local_min_z = torch.min(ventricle_indices[:, 4]).item()
+
+        max_x = max(max_x, local_max_x)
+        min_x = min(min_x, local_min_x)
+        max_y = max(max_y, local_max_y)
+        min_y = min(min_y, local_min_y)
+        max_z = max(max_z, local_max_z)
+        min_z = min(min_z, local_min_z)
+
+    margin = 5
+    max_x = min(max_x + margin, shape[2])
+    min_x = max(min_x - margin, 0)
+    max_y = min(max_y + margin, shape[3])
+    min_y = max(min_y - margin, 0)
+    max_z = min(max_z + margin, shape[4])
+    min_z = max(min_z - margin, 0)
+    
+    return (max_x, min_x), (max_y, min_y), (max_z, min_z)
+
+from typing import Callable
+
+def get_crop_to_max_ventricle_shape(dataloader) -> Callable[[dict], dict]:
+    (max_x, min_x), (max_y, min_y), (max_z, min_z) = get_max_ventricle_crop(dataloader)
+
+    return lambda x: x[:, :, min_x:max_x, min_y:max_y, min_z:max_z]
+
 synthseg_class_to_string_map = {
 0:         "background",
 2:         "left cerebral white matter",
