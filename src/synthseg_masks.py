@@ -1,4 +1,5 @@
 import torch
+from torch import Tensor
 from src.torch_setup import device
 from generative.networks.nets.autoencoderkl import AutoencoderKL 
 import torch.nn as nn
@@ -10,6 +11,21 @@ synthseg_classes = [ 0,  2,  3,  4,  5,  7,  8, 10, 11,
                      51, 52, 53, 54, 58, 60]
 
 synthseg_index_mask_value_map = {idx:c for idx, c in enumerate(synthseg_classes)}
+
+ventricles = [
+    "right lateral ventricle",
+    "right inferior lateral ventricle",
+    "left lateral ventricle",
+    "left inferior lateral ventricle",
+    "3rd ventricle",
+    "4th ventricle",
+]
+
+def reduce_mask_to_ventricles(mask: Tensor, device=device):
+    ventricle_indices = torch.tensor([index for index, name in synthseg_class_to_string_map.items() 
+                                      if name in ventricles]).to(device)
+
+    return torch.isin(mask, ventricle_indices)
 
 synthseg_class_to_string_map = {
 0:         "background",
