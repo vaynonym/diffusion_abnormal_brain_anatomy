@@ -1,9 +1,8 @@
 import torch
 from torch import Tensor
 from src.torch_setup import device
-from generative.networks.nets.autoencoderkl import AutoencoderKL 
-import torch.nn as nn
-from typing import Tuple
+from typing import Callable
+
 
 synthseg_classes = [ 0,  2,  3,  4,  5,  7,  8, 10, 11,
                      12, 13, 14, 15, 16, 17, 18, 24, 26,
@@ -12,15 +11,6 @@ synthseg_classes = [ 0,  2,  3,  4,  5,  7,  8, 10, 11,
 
 synthseg_index_mask_value_map = {idx:c for idx, c in enumerate(synthseg_classes)}
 
-ventricles = [
-    "right lateral ventricle",
-    "right inferior lateral ventricle",
-    "left lateral ventricle",
-    "left inferior lateral ventricle",
-    "3rd ventricle",
-    "4th ventricle",
-]
-
 def reduce_mask_to_ventricles(mask: Tensor, device=device):
     ventricle_indices = torch.tensor([index for index, name in synthseg_class_to_string_map.items() 
                                       if name in ventricles]).to(device)
@@ -28,14 +18,14 @@ def reduce_mask_to_ventricles(mask: Tensor, device=device):
     return torch.isin(mask, ventricle_indices)
 
 def get_max_ventricle_crop(dataloader):
-    (i, first) : Tuple[int, Tensor] = next(enumerate(dataloader))
+    (i, first) = next(enumerate(dataloader))
     mask : Tensor = first["mask"]
     assert len(list(mask.shape)) == 5
     shape = mask.shape
     max_x, max_y, max_z  = tuple(shape[2:] // 2)
     min_x, min_y, min_z  = tuple(shape[2:] // 2)
     del mask
-    
+
     for _, batch in enumerate(dataloader):
         ventricle_mask = reduce_mask_to_ventricles(batch["mask"])
         ventricle_indices = ventricle_mask.nonzero()
@@ -63,8 +53,6 @@ def get_max_ventricle_crop(dataloader):
     min_z = max(min_z - margin, 0)
     
     return (max_x, min_x), (max_y, min_y), (max_z, min_z)
-
-from typing import Callable
 
 def get_crop_to_max_ventricle_shape(dataloader) -> Callable[[dict], dict]:
     (max_x, min_x), (max_y, min_y), (max_z, min_z) = get_max_ventricle_crop(dataloader)
@@ -107,6 +95,28 @@ synthseg_class_to_string_map = {
 60:        "right ventral DC",
 }
 
+ventricles = [
+    "right lateral ventricle",
+    "right inferior lateral ventricle",
+    "left lateral ventricle",
+    "left inferior lateral ventricle",
+    "3rd ventricle",
+    "4th ventricle",
+]
+
+ventricle_indices  = torch.tensor([index for index, name in synthseg_class_to_string_map.items() 
+                                      if name in ventricles]).to(device)
+
+white_matter = [
+    "left cerebral white matter",
+    "left cerebellum white matter",
+    "right cerebral white matter",
+    "right cerebellum white matter",
+]
+
+white_matter_indices = torch.tensor([index for index, name in synthseg_class_to_string_map.items() 
+                                      if name in white_matter]).to(device)
+
 def encode_one_hot(mask: torch.Tensor, device=device):
     shp = list(mask.shape)
     shp[1] = len(synthseg_classes)
@@ -116,6 +126,7 @@ def encode_one_hot(mask: torch.Tensor, device=device):
     
     return one_hot
 
+# decodes to actual synthseg values
 def decode_one_hot(mask: torch.Tensor, device=device):
     # [B, C, SPATIALS]
     assert len(list(mask.shape)) == 5
