@@ -1,12 +1,9 @@
 import torch
-from generative.inferers import LatentDiffusionInferer
-from generative.networks.nets import AutoencoderKL, DiffusionModelUNet
-from generative.networks.schedulers import DDPMScheduler
-
-from src.util import log_image_to_wandb
-from src.logging_util import LOGGER
 from torch.cuda.amp import autocast
+from generative.networks.nets import AutoencoderKL
 
+
+from src.logging_util import LOGGER
 from src.torch_setup import device
 
 
