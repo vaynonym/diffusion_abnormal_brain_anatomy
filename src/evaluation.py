@@ -1,29 +1,27 @@
-from src.util import Stopwatch, log_image_to_wandb
-from src.logging_util import LOGGER
-import torch
-import wandb
 from generative.metrics import FIDMetric, MMDMetric, MultiScaleSSIMMetric, SSIMMetric
 from generative.inferers import LatentDiffusionInferer
-from generative.networks.nets import AutoencoderKL
-
 from monai.networks.nets.resnet import resnet50
+
+import wandb
+import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader 
+from torch.utils.data import DataLoader, RandomSampler, ConcatDataset
 from torch import Tensor
+import torch.nn.functional as F
+from torchmetrics.classification import Dice
 
 import os.path
 from collections import OrderedDict
-import torch.nn.functional as F
-import torchvision
 from typing import Tuple, Optional
 
 from src.directory_management import PRETRAINED_MODEL_DIRECTORY
 from src.torch_setup import device
-from src.util import log_image_with_mask, log_image_to_wandb
-from src.synthseg_masks import decode_one_hot, encode_one_hot
+from src.util import log_image_with_mask, log_image_to_wandb, Stopwatch
+from src.logging_util import LOGGER
+from src.synthseg_masks import decode_one_hot, encode_one_hot, get_crop_to_max_ventricle_shape
 from src.custom_autoencoders import IAutoencoder
 from itertools import combinations
-from torch.utils.data import RandomSampler, ConcatDataset
+from torch.nn import L1Loss
 
 
 
@@ -33,13 +31,31 @@ class AutoencoderEvaluator():
                  autoencoder: IAutoencoder,
                  val_loader: Optional[DataLoader],
                  wandb_prefix: str,
+                 crop_to_ventricles=False,
                  ) -> None:
         self.autoencoder = autoencoder
         self.wandb_prefix = wandb_prefix
         self.val_loader = val_loader
+
+        if crop_to_ventricles:
+            self.crop_to_ventricles = get_crop_to_max_ventricle_shape(self.val_loader)
+        else:
+            self.crop_to_ventricles = None
+        
+        self.metrics = { 
+            "MS-SSIM": MultiScaleSSIMMetric(spatial_dims=3, data_range=1.0, kernel_size=4),
+            "SSIM": SSIMMetric(spatial_dims=3, data_range=1.0, kernel_size=4),
+            "MMD": MMDMetric(),
+            "L1-Loss": L1Loss(),
+        }
   
-    def prepare_input_for_logging(self, input):
-        return torch.clamp(input, 0, 1)
+    def evaluation_preprocessing(self, img):
+        img = torch.clamp(img, 0, 1)
+
+        if self.crop_to_ventricles is not None:
+            img = self.crop_to_ventricles(img)
+        
+        return img
     
     def get_input_from_batch(self, batch) -> Tuple[Tensor, ...]:
         return (batch["image"].to(device),)
@@ -60,8 +76,8 @@ class AutoencoderEvaluator():
             
             wandb.log({f"{self.wandb_prefix}/max_r_intensity": reconstruction.max().item(), f"{self.wandb_prefix}/min_r_intensity": reconstruction.min().item()})
 
-            reconstruction_for_logging = self.prepare_input_for_logging(reconstruction)[0, 0].detach().cpu().numpy()
-            image_for_logging = self.prepare_input_for_logging(ground_truth)[0, 0].detach().cpu().numpy()
+            reconstruction_for_logging = self.evaluation_preprocessing(reconstruction)[0, 0].detach().cpu().numpy()
+            image_for_logging = self.evaluation_preprocessing(ground_truth)[0, 0].detach().cpu().numpy()
 
             log_image_to_wandb(image_for_logging, reconstruction_for_logging, f"{self.wandb_prefix}/reconstruction", True,
                         conditioning_information=conditioning)
@@ -79,24 +95,21 @@ class AutoencoderEvaluator():
 
         self.autoencoder.eval()
         
-        metrics = { 
-            "MS-SSIM": MultiScaleSSIMMetric(spatial_dims=3, data_range=1.0, kernel_size=4),
-            "SSIM": SSIMMetric(spatial_dims=3, data_range=1.0, kernel_size=4),
-            "MMD": MMDMetric(),
-        }
-        
-        accumulations = [[] for _ in metrics.keys()]
+        accumulations = [[] for _ in self.metrics.keys()]
 
 
-        for _, batch in enumerate(self.val_loader):
-            model_input = self.get_input_from_batch(batch)
-            ground_truth = self.get_input_for_evaluation_from_batch(model_input, batch)
-
+        for i, batch in enumerate(self.val_loader):
             with torch.no_grad():
-                reconstruction = self.autoencoder.reconstruct(*model_input)
+                model_input = self.get_input_from_batch(batch)
+                ground_truth = self.get_input_for_evaluation_from_batch(model_input, batch)
+                ground_truth = self.evaluation_preprocessing(ground_truth)
 
-                for metric, accumulator in zip(metrics.values(), accumulations):
-                    res = metric(ground_truth, reconstruction)
+                reconstruction = self.autoencoder.reconstruct(*model_input)
+                reconstruction = self.evaluation_preprocessing(reconstruction)
+
+                for metric, accumulator in zip(self.metrics.values(), accumulations):
+                    # clipping images since some metrics assume data range from 0 to 1
+                    res = metric(reconstruction, ground_truth)
                     if(len(res.size()) == 0):
                         res = res.unsqueeze(0)
                     accumulator.append(res)
@@ -104,11 +117,19 @@ class AutoencoderEvaluator():
         with torch.no_grad():
             wandb.log(
                 {
-                    f"{self.wandb_prefix}/{name}": (torch.cat(accumulator, dim=0).mean().item()) for (name, accumulator) in zip(metrics.keys(), accumulations)
+                    f"{self.wandb_prefix}/{name}": (torch.cat(accumulator, dim=0).mean().item()) for (name, accumulator) in zip(self.metrics.keys(), accumulations)
                 }
             )
         
         return None
+
+
+
+# Generates Masks
+
+from torch.nn.functional import softmax
+from torchmetrics.classification import MulticlassJaccardIndex as IoU
+from src.synthseg_masks import synthseg_classes
 
 class MaskAutoencoderEvaluator(AutoencoderEvaluator):
     def __init__(self, 
@@ -118,18 +139,35 @@ class MaskAutoencoderEvaluator(AutoencoderEvaluator):
                  ) -> None:
         super().__init__(autoencoder, val_loader, wandb_prefix)
 
-    def prepare_input_for_logging(self, input):
-        return decode_one_hot(input)
+        self.metric_Dice = Dice(average='micro').to(device)
+        self.metric_IoU = IoU(num_classes=len(synthseg_classes), average="micro").to(device)
+        self.metric_CrossEntropy = nn.CrossEntropyLoss().to(device)
+
+        self.metrics = { # x is logits, y is one-hot encoded, so most metrics require preprocessing
+            # Segmentation-based metrics
+            "IoU": lambda x, y: self.metric_IoU(x, y.argmax(dim=1)),
+            "Dice": lambda x, y: self.metric_Dice(x, y.argmax(dim=1)),
+            "CrossEntropy": lambda x, y: self.metric_CrossEntropy(x, y.argmax(dim=1))
+        }
+
+    def evaluation_preprocessing(self, x): 
+        if self.crop_to_ventricles is not None:
+            x = self.crop_to_ventricles(x)
+        
+        return x
     
     def get_input_from_batch(self, batch) -> Tuple[Tensor, ...]:
         mask = encode_one_hot(batch["mask"].to(device))
         return (mask,)
-
+    
+    def get_input_for_evaluation_from_batch(self, model_input: Tuple[Tensor, ...], batch: dict) -> Tensor:
+        return model_input[0] # one-hot encoded
+    
     def visualize_batch(self, batch):
         # select first sample from last training batch as example evaluation
         with torch.no_grad():
             self.autoencoder.eval()
-            image = super().prepare_input_for_logging(batch["image"].to(device))[0, 0].detach().cpu().numpy()
+            image = super().evaluation_preprocessing(batch["image"].to(device))[0, 0].detach().cpu().numpy()
             original_mask = batch["mask"][0, 0].detach().cpu().numpy()
             conditioning=batch["volume"][0].detach().cpu()
 
@@ -140,7 +178,7 @@ class MaskAutoencoderEvaluator(AutoencoderEvaluator):
             wandb.log({f"{self.wandb_prefix}/max_r_intensity": reconstruction.max().item(),
                         f"{self.wandb_prefix}/min_r_intensity": reconstruction.min().item()})
 
-            reconstructed_mask_decoded = self.prepare_input_for_logging(reconstruction)[0, 0].detach().cpu().numpy()
+            reconstructed_mask_decoded = self.evaluation_preprocessing(decode_one_hot(reconstruction))[0, 0].detach().cpu().numpy()
 
             log_image_with_mask(image=image, 
                                 original_mask=original_mask,
@@ -149,18 +187,18 @@ class MaskAutoencoderEvaluator(AutoencoderEvaluator):
                                 description_prefix=f"{self.wandb_prefix}/masks_reconstruction",
                                 conditioning_information=conditioning) 
 
-
-class SegmentationMaskAutoencoderEvaluator(MaskAutoencoderEvaluator):
+# Generates Masks
+class MaskEmbeddingAutoencoderEvaluator(MaskAutoencoderEvaluator):
     def __init__(self, autoencoder: IAutoencoder, val_loader: Optional[DataLoader], wandb_prefix: str) -> None:
         super().__init__(autoencoder, val_loader, wandb_prefix)
     
     def get_input_from_batch(self, batch) -> Tuple[Tensor, None]:
-        return (batch["mask"].int().to(device), None)
+        return (batch["mask"].int().to(device), )
 
     def get_input_for_evaluation_from_batch(self, model_input: Tuple[Tensor, ...], batch: dict) -> Tensor:
-        mask = encode_one_hot(model_input[0])
-        return (mask)
+        return encode_one_hot(model_input[0])
 
+# Generates Images
 class SpadeAutoencoderEvaluator(AutoencoderEvaluator):
     def __init__(self, autoencoder: IAutoencoder, val_loader: Optional[DataLoader], wandb_prefix: str) -> None:
         super().__init__(autoencoder, val_loader, wandb_prefix)
@@ -174,19 +212,20 @@ class SpadeAutoencoderEvaluator(AutoencoderEvaluator):
 
 
 ############### Diffusion Model Evaluation #####################
-
 class DiffusionModelEvaluator():
     def __init__(self, 
                  diffusion_model: nn.Module,
-                 scheduler,
+                 evaluation_scheduler,
                  autoencoder: IAutoencoder,
                  latent_shape: torch.Size,
                  inferer: LatentDiffusionInferer,
                  val_loader: DataLoader,
                  train_loader: DataLoader,
-                 wandb_prefix: str) -> None:
+                 wandb_prefix: str,
+                 crop_to_ventricles=False,
+                 ) -> None:
         self.diffusion_model = diffusion_model
-        self.scheduler = scheduler
+        self.evaluation_scheduler = evaluation_scheduler
         self.autoencoder = autoencoder
         self.latent_shape = latent_shape
         self.inferer = inferer
@@ -194,6 +233,18 @@ class DiffusionModelEvaluator():
         self.train_loader = train_loader
 
         self.wandb_prefix = wandb_prefix
+
+        if crop_to_ventricles:
+            LOGGER.info("Evaluation is cropping to ventricle shape")
+            self.crop_to_ventricles = get_crop_to_max_ventricle_shape(self.train_loader)
+        else:
+            self.crop_to_ventricles = None
+
+        self.diversity_metrics = [
+            ("MS-SSIM", MultiScaleSSIMMetric(spatial_dims=3, data_range=1.0, kernel_size=4)),
+            ("SSIM", SSIMMetric(spatial_dims=3, data_range=1.0, kernel_size=4)),
+            ("MMD", MMDMetric()),
+        ]
 
         self.load_feature_extraction_model()
     
@@ -236,7 +287,7 @@ class DiffusionModelEvaluator():
             real_images, _ = self.get_input_from_batch(batch)
             with torch.no_grad():
                 
-                normalized = self.medicalNetNormalize(torch.clamp(real_images, 0., 1.))
+                normalized = self.medicalNetNormalize(self.image_preprocessing(real_images))
                 #if i < 2:
                 #    log_image_to_wandb(real_images[0, 0].detach().cpu().numpy(), None, "MedicalnetNormalize/pristine", True, None, None)
                 #    log_image_to_wandb(real_images[1, 0].detach().cpu().numpy(), None, "MedicalnetNormalize/pristine", True, None, None)
@@ -252,28 +303,36 @@ class DiffusionModelEvaluator():
     def get_additional_input_from_batch(self, batch) -> dict:
         return {"conditioning": batch["volume"].to(device)}
     
-    def get_synthetic_images(self, batch):
+    def get_synthetic_output(self, batch, use_evaluation_scheduler):
         latent_noise = torch.randn(self.latent_shape).to(device)    
         additional_inputs = self.get_additional_input_from_batch(batch)
-        return self.inferer.sample(input_noise=latent_noise,
+        res = self.inferer.sample(input_noise=latent_noise,
                                    autoencoder_model=self.autoencoder,
                                    diffusion_model=self.diffusion_model,
-                                   scheduler=self.scheduler, 
+                                   scheduler=self.evaluation_scheduler if use_evaluation_scheduler else self.inferer.scheduler, 
                                    **additional_inputs)
+        return res
+    
+    def image_preprocessing(self, image):
+        with torch.no_grad():
+            image = torch.clamp(image, 0, 1)
+            if self.crop_to_ventricles is not None:
+                image = self.crop_to_ventricles(image)
+        
+        return image
     
     def get_synthetic_features(self, count):
         batch_size = self.latent_shape[0]
         synth_features = []
 
-        for i, batch in enumerate(self.train_loader):
+        for i, batch in enumerate(self.val_loader):
             # Get the real images
-            self.scheduler.set_timesteps(num_inference_steps=1000)
 
             # Generate some synthetic images using the defined model
-            synthetic_images=self.get_synthetic_images(batch)
+            synthetic_images=self.get_synthetic_output(batch, True)
 
             with torch.no_grad():
-                synthetic_images = self.medicalNetNormalize(torch.clamp(synthetic_images, 0., 1.))
+                synthetic_images = self.medicalNetNormalize(self.image_preprocessing(synthetic_images))
 
                 # Get the features for the synthetic data
                 # Generating images far dominates the time to extract features
@@ -296,34 +355,28 @@ class DiffusionModelEvaluator():
                    batch_size=self.train_loader.batch_size * batch_size_multiplier,
                    shuffle=False,
                    drop_last=self.train_loader.drop_last, 
-                   num_workers=self.train_loader.num_workers,
+                   num_workers=1,
                    persistent_workers=self.train_loader.persistent_workers,
-                   sampler=RandomSampler(combined_dataset, replacement=True, num_samples=count)
+                   sampler=RandomSampler(combined_dataset, replacement=True, num_samples=count,)
                    )
         
         old_latent_shape = self.latent_shape
         # temporarily double batch size
         self.latent_shape = torch.Size([self.latent_shape[0] * batch_size_multiplier, *self.latent_shape[1:]])
 
-        metrics = [
-        ("MS-SSIM", MultiScaleSSIMMetric(spatial_dims=3, data_range=1.0, kernel_size=4), []),
-        ("SSIM", SSIMMetric(spatial_dims=3, data_range=1.0, kernel_size=4), []),
-        ("MMD", MMDMetric(), []),
-        ]
+        diversity_metrics = list(zip(self.diversity_metrics, [[]] * len(self.diversity_metrics)))
 
         current_count = 0
         for i, batch in enumerate(combined_dataloader):
             # Get the real images
-            self.scheduler.set_timesteps(num_inference_steps=1000)
-
             # Generate some synthetic images using the defined model
-            synthetic_images=self.get_synthetic_images(batch)
+            synthetic_images=self.get_synthetic_output(batch, True)
             
             combinations_in_batch = list(combinations(range(self.latent_shape[0]), 2))
             for idx_a, idx_b in combinations_in_batch:
-                for _, metric, scores in metrics:
-                    res = metric(synthetic_images[idx_a].unsqueeze(0), 
-                                 synthetic_images[idx_b].unsqueeze(0))
+                for (_, metric), scores in diversity_metrics:
+                    res = metric(self.image_preprocessing(synthetic_images[idx_a].unsqueeze(0)), 
+                                 self.image_preprocessing(synthetic_images[idx_b].unsqueeze(0)))
                     if(len(res.size()) == 0):
                         res = res.unsqueeze(0)
                     scores.append(res)
@@ -339,7 +392,7 @@ class DiffusionModelEvaluator():
         LOGGER.info(f"Number of batches for diversity metrics: { i + 1}")
 
         results = {
-            f"{self.wandb_prefix}/{name}": torch.cat(scores, dim=0).mean().item() for name, _, scores in metrics
+            f"{self.wandb_prefix}/{name}": torch.cat(scores, dim=0).mean().item() for (name, _), scores in diversity_metrics
         }
 
         # return batch size to original value
@@ -347,12 +400,10 @@ class DiffusionModelEvaluator():
 
         return results
 
-
-    
     # fid is calculated on train dataset
     def calculate_fid(self):
-        real_features = self.get_real_features(self.train_loader)
-        synthetic_features = self.get_synthetic_features(4)
+        real_features = self.get_real_features(self.val_loader)
+        synthetic_features = self.get_synthetic_features(100)
 
         fid = FIDMetric()(synthetic_features, real_features)
         return fid
@@ -361,40 +412,153 @@ class DiffusionModelEvaluator():
         with torch.no_grad():
             self.autoencoder.eval()
             self.diffusion_model.eval()
-            fid = self.calculate_fid()
+            with Stopwatch("FID took: "):
+                fid = self.calculate_fid()
             results = {f"{self.wandb_prefix}/FID": fid.item()}
-            diversity_metrics = self.calculate_diversity_metrics(15)
+            with Stopwatch("Diversity metrics took: "):
+                diversity_metrics = self.calculate_diversity_metrics(100)
 
         results.update(diversity_metrics)
         wandb.log(results)
     
-    def log_samples(self, count):
+    def log_samples(self, count, use_evaluation_scheduler=False):
         self.autoencoder.eval()
         self.diffusion_model.eval()
 
         batch_size = self.latent_shape[0]
         for i, batch in enumerate(self.val_loader):
-            self.scheduler.set_timesteps(num_inference_steps=1000)
 
-            synthetic_images = self.get_synthetic_images(batch)
+            synthetic_images = self.get_synthetic_output(batch, use_evaluation_scheduler)
             additional_inputs = self.get_additional_input_from_batch(batch)
 
             # ### Visualise synthetic data
             for batch_index in range(batch_size):
-                img = synthetic_images[batch_index, 0].detach().cpu().numpy()  # images
+                img = self.image_preprocessing(synthetic_images[batch_index, 0]).detach().cpu().numpy()  # images
 
                 if "conditioning" in additional_inputs.keys():
                     conditioning = additional_inputs["conditioning"]
                 else:
                     conditioning = None
                 
+                
+                
                 log_image_to_wandb(img, None, f"{self.wandb_prefix}/sample_images", True, conditioning[batch_index, 0].detach().cpu())
 
-                if (i + 1) * batch_size + (batch_index + 1) >= count:
+                if i * batch_size + (batch_index + 1) >= count:
                     break
             
             if (i + 1) * batch_size >= count:
                 break
+
+class MaskDiffusionModelEvaluator(DiffusionModelEvaluator):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        
+
+        self.metric_Dice = Dice(average='micro').to(device)
+        self.metric_IoU = IoU(num_classes=len(synthseg_classes), average="micro").to(device)
+        self.metric_CrossEntropy = nn.CrossEntropyLoss().to(device)
+
+        self.metrics = { # x is logits, y [0...C) values
+            "IoU": lambda x, y: self.metric_IoU(x, y),
+            "Dice": lambda x, y: self.metric_Dice(x, y),
+            "CrossEntropy": lambda x, y: self.metric_CrossEntropy(x, y)
+        }
+
+        self.diversity_metrics = {
+            ("Pairwise IoU", lambda x, y: self.metric_IoU(x.argmax(dim=1), y.argmax(dim=1))),
+            ("Pairwise Dice", lambda x, y: self.metric_Dice(x.argmax(dim=1), y.argmax(dim=1))),
+        }
+
+
+    def image_preprocessing(self, image):
+        with torch.no_grad():
+            if self.crop_to_ventricles is not None:
+                image = self.crop_to_ventricles(image)
+        
+        return image
+    
+    def get_synthetic_features(self, count):
+        pass
+
+    def get_real_features(self, dataloader: DataLoader):
+        pass
+
+    def calculate_fid(self):
+        pass
+
+    def calculate_reconstruction_metrics(self):
+
+        accumulations = [[] for _ in self.metrics.keys()]
+
+
+        for i, batch in enumerate(self.val_loader):
+            with torch.no_grad():
+                # convert to [0...C) indices
+                ground_truth = self.image_preprocessing(encode_one_hot(batch["mask"].to(device))).argmax(dim=1)
+                reconstruction = self.image_preprocessing(self.get_synthetic_output(batch, True))
+
+                for metric, accumulator in zip(self.metrics.values(), accumulations):
+                    # clipping images since some metrics assume data range from 0 to 1
+                    res = metric(reconstruction, ground_truth)
+                    if(len(res.size()) == 0):
+                        res = res.unsqueeze(0)
+                    accumulator.append(res)
+
+        with torch.no_grad():
+            results = {
+                    f"{self.wandb_prefix}/{name}": (torch.cat(accumulator, dim=0).mean().item()) for (name, accumulator) in zip(self.metrics.keys(), accumulations)
+                }
+        
+        return results
+
+
+    def evaluate(self):
+        with torch.no_grad():
+            self.autoencoder.eval()
+            self.diffusion_model.eval()
+            results = {}
+            with Stopwatch("Reconstruction  metrics: "):
+                reconstruction_metrics = self.calculate_reconstruction_metrics()
+                results.update(reconstruction_metrics)
+            with Stopwatch("Diversity metrics took: "):
+                diversity_metrics = self.calculate_diversity_metrics(100)
+                results.update(diversity_metrics)
+
+        wandb.log(results)
+
+
+    def log_samples(self, count, use_evaluation_scheduler=False):
+        self.autoencoder.eval()
+        self.diffusion_model.eval()
+
+        batch_size = self.latent_shape[0]
+        for i, batch in enumerate(self.val_loader):
+            synthetic_output = decode_one_hot(self.get_synthetic_output(batch, use_evaluation_scheduler))
+
+            # ### Visualise synthetic data
+            for batch_index in range(batch_size):
+                synth_mask = self.image_preprocessing(synthetic_output)[batch_index, 0].detach().cpu().numpy()  # images
+                original_image = super().image_preprocessing(batch["image"])[batch_index, 0].detach().cpu().numpy()
+                ground_truth_mask = self.image_preprocessing(batch["mask"])[batch_index, 0].detach().cpu().numpy()
+
+                if "volume" in batch.keys():
+                    volume = batch["volume"][batch_index, 0].detach().cpu()
+                
+                log_image_with_mask(image=original_image, 
+                                    original_mask=ground_truth_mask, 
+                                    reconstruction_image=original_image,
+                                    reconstruction_mask=synth_mask,
+                                    description_prefix=f"{self.wandb_prefix}/sample_images",
+                                    conditioning_information=volume)
+                
+                if i * batch_size + (batch_index + 1) >= count:
+                    break
+                
+            
+            if (i + 1) * batch_size >= count:
+                break
+
 
 class SpadeDiffusionModelEvaluator(DiffusionModelEvaluator):
     def __init__(self, *args, **kwargs) -> None:
@@ -403,7 +567,13 @@ class SpadeDiffusionModelEvaluator(DiffusionModelEvaluator):
     def get_additional_input_from_batch(self, batch) -> dict:
         return {"seg": encode_one_hot(batch["mask"].to(device))}
     
-    def log_samples(self, count):
+    def mask_preprocessing(self, image):
+        if self.crop_to_ventricles is not None:
+            image = self.crop_to_ventricles(image)
+        
+        return image
+    
+    def log_samples(self, count, use_evaluation_scheduler=False):
         self.autoencoder.eval()
         self.diffusion_model.eval()
 
@@ -411,31 +581,32 @@ class SpadeDiffusionModelEvaluator(DiffusionModelEvaluator):
         for i, batch in enumerate(self.val_loader):
             input_noise =  torch.randn(self.latent_shape).to(device)
             additional_inputs = self.get_additional_input_from_batch(batch)
-
-            self.scheduler.set_timesteps(num_inference_steps=1000)
             
             synthetic_images = self.inferer.sample(
                                             input_noise=input_noise,
                                             autoencoder_model=self.autoencoder,
                                             diffusion_model=self.diffusion_model,
-                                            scheduler=self.scheduler,
+                                            scheduler=self.evaluation_scheduler if use_evaluation_scheduler else self.inferer.scheduler,
                                             **additional_inputs
                                             )
 
             # ### Visualise synthetic data
             for batch_index in range(batch_size):
-                synth_image = synthetic_images[batch_index, 0].detach().cpu().numpy()  # images
-                original_image = batch["image"][batch_index, 0].detach().cpu().numpy()
-                mask = batch["mask"][batch_index, 0].detach().cpu().numpy()
+                synth_image = self.image_preprocessing(synthetic_images[batch_index, 0]).detach().cpu().numpy()  # images
+                original_image = self.image_preprocessing(batch["image"][batch_index, 0]).detach().cpu().numpy()
+                mask = self.mask_preprocessing(batch["mask"][batch_index, 0]).detach().cpu().numpy()
+
+                if "volume" in batch.keys():
+                    volume = batch["volume"][batch_index, 0].detach().cpu()
                 
                 log_image_with_mask(image=original_image, 
                                     original_mask=mask, 
                                     reconstruction_image=synth_image,
                                     reconstruction_mask=mask,
                                     description_prefix=f"{self.wandb_prefix}/sample_images",
-                                    conditioning_information=None)
+                                    conditioning_information=volume)
                 
-                if (i + 1) * batch_size + (batch_index + 1) >= count:
+                if i * batch_size + (batch_index + 1) >= count:
                     break
                 
             
