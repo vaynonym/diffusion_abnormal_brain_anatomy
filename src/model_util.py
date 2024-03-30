@@ -67,7 +67,8 @@ def load_model_from_run_with_matching_config(subconfigs, subconfig_names, projec
     os.remove(downloaded_file_path)
 
     # have wandb show connection between runs
-    wandb.use_artifact(fitting_artifact.name)
+    if wandb.run is not None:
+        wandb.use_artifact(fitting_artifact.name)
 
     return model
 

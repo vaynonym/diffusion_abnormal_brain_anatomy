@@ -107,6 +107,9 @@ ventricles = [
 ventricle_indices  = torch.tensor([index for index, name in synthseg_class_to_string_map.items() 
                                       if name in ventricles]).to(device)
 
+assert len(ventricle_indices) == 6
+
+
 white_matter = [
     "left cerebral white matter",
     "left cerebellum white matter",
@@ -116,6 +119,35 @@ white_matter = [
 
 white_matter_indices = torch.tensor([index for index, name in synthseg_class_to_string_map.items() 
                                       if name in white_matter]).to(device)
+
+assert len(white_matter_indices) == 4
+
+
+background = ["background"]
+
+background_indices = torch.tensor([index for index, name in synthseg_class_to_string_map.items() 
+                                      if name in background]).to(device)
+
+assert len(background_indices) == 1
+
+cortex = [
+          "right cerebellum cortex",
+          "right cerebral cortex",
+          "left cerebellum cortex",
+          "left cerebral cortex",
+          ]
+
+cortex_indices = torch.tensor([index for index, name in synthseg_class_to_string_map.items() 
+                                      if name in cortex]).to(device)
+
+assert len(cortex_indices) == 4
+
+CSF = ["CSF"]
+
+CSF_indices = torch.tensor([index for index, name in synthseg_class_to_string_map.items() 
+                                      if name in CSF]).to(device)
+
+assert len(CSF_indices) == 1
 
 def encode_one_hot(mask: torch.Tensor, device=device):
     shp = list(mask.shape)

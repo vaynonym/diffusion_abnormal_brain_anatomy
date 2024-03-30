@@ -2,18 +2,19 @@ import yaml
 import torch
 import matplotlib.pyplot as plt
 import wandb
-import warnings
 import numpy as np
-from monai.data.meta_tensor import MetaTensor
 import time
-from datetime import timedelta
-from src.logging_util import LOGGER, all_logging_disabled
 import yaml
+from datetime import timedelta
 from pathlib import Path
-from src.directory_management import BASE_DIRECTORY
 import os
+from typing import Optional
+
+from monai.data.meta_tensor import MetaTensor
+from src.directory_management import BASE_DIRECTORY
+from src.logging_util import LOGGER, all_logging_disabled
 from src.torch_setup import device
-from src.synthseg_masks import synthseg_classes, synthseg_class_to_string_map
+from src.synthseg_masks import synthseg_class_to_string_map
 
 def load_wand_credentials():
     with open(os.path.join(BASE_DIRECTORY, "local_config.yml")) as file:
@@ -29,7 +30,7 @@ def log_image_with_mask(image: np.ndarray,
                         reconstruction_image: np.ndarray = None,
                         reconstruction_mask: np.ndarray = None,
                         description_prefix="",
-                        conditioning_information=None,
+                        conditioning_information=Optional[torch.Tensor],
                         ):
 
     if conditioning_information:
@@ -214,3 +215,15 @@ def measure_time(prefix_string: str):
 
 def read_config(path: str):
     return yaml.safe_load(Path(path).read_text())
+
+def read_config_from_wandb_run(entity, project, id: str):
+    api = wandb.Api()
+    run = api.run(f"{entity}/{project}/{id}")
+    #run.file("config.yml").download()
+    relevant_configs = ["run_config",
+                   "auto_encoder_config", 
+                   "patch_discrim_config",
+                   "auto_encoder_training_config",
+                   "diffusion_model_unet_config",
+                   "diffusion_model_training_config",]
+    return {k:v.value for k, v in run.config if k in relevant_configs}
