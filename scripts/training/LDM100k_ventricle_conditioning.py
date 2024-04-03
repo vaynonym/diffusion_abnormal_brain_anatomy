@@ -11,22 +11,19 @@ from torch.cuda.amp import GradScaler, autocast
 
 from generative.inferers import LatentDiffusionInferer
 from generative.networks.nets import AutoencoderKL, DiffusionModelUNet
-from generative.networks.schedulers import DDPMScheduler
+from generative.networks.schedulers import DDPMScheduler, DDIMScheduler
 
 import wandb
 import numpy as np
 
-from src.util import load_wand_credentials, log_image_to_wandb, Stopwatch, read_config, visualize_reconstructions, log_image_with_mask
+from src.util import load_wand_credentials, log_image_to_wandb, Stopwatch, read_config, visualize_reconstructions
 from src.model_util import save_model_as_artifact, load_model_from_run_with_matching_config, check_dimensions
-from src.training import train_diffusion_model
 from src.logging_util import LOGGER
 from src.datasets import SyntheticLDM100K
 from src.diffusion import get_scale_factor
 from src.directory_management import DATA_DIRECTORY
-from src.trainer import SegmentationAutoencoderTrainer, SegmentationEmbeddingAutoencoderTrainer
-from src.evaluation import MaskAutoencoderEvaluator, SegmentationMaskAutoencoderEvaluator
-from src.custom_autoencoders import EmbeddingWrapper
-from src.synthseg_masks import synthseg_classes
+from src.trainer import AutoencoderTrainer, DiffusionModelTrainer
+from src.evaluation import DiffusionModelEvaluator
 
 import torch.multiprocessing
 
@@ -68,14 +65,6 @@ def peek_shape(x):
     LOGGER.info(x.shape)
     return x
 
-def peek_max(x):
-    LOGGER.info(f"max {x.max()}")
-    return x
-
-def peek_min(x):
-    LOGGER.info(f"min {x.min()}")
-    return x
-
 def peek(x):
     LOGGER.info(x)
     return x
@@ -83,18 +72,20 @@ def peek(x):
 
 train_transforms = transforms.Compose(
     [
-        transforms.LoadImaged(keys=["mask", "image"]),
-        transforms.EnsureChannelFirstd(keys=["mask", "image"]),
-        transforms.EnsureTyped(keys=["mask", "image"]),
-        transforms.Orientationd(keys=["mask", "image"], axcodes="IPL"), # axcodes="RAS"
-        transforms.Spacingd(keys=["mask"], pixdim=run_config["input_image_downsampling_factors"], mode=("nearest")),
+        transforms.LoadImaged(keys=["image"]),
+        transforms.EnsureChannelFirstd(keys=["image"]),
+        transforms.Lambdad(keys="image", func=lambda x: x[0, :, :, :]),
+        transforms.EnsureChannelFirstd(keys=["image"], channel_dim="no_channel"),
+        #transforms.Lambdad(keys="image", func=peek_shape),
+        #transforms.Lambdad(keys="volume", func=peek),
+        transforms.EnsureTyped(keys=["image"]),
+        transforms.Orientationd(keys=["image"], axcodes="IPL"), # axcodes="RAS"
         transforms.Spacingd(keys=["image"], pixdim=run_config["input_image_downsampling_factors"], mode=("bilinear")),
-        transforms.CenterSpatialCropd(keys=["mask", "image"], roi_size=run_config["input_image_crop_roi"]),
+        transforms.CenterSpatialCropd(keys=["image"], roi_size=run_config["input_image_crop_roi"]),
         transforms.ScaleIntensityRangePercentilesd(keys=["image"], lower=0.5, upper=99.5, b_min=0, b_max=1, clip=True),
         transforms.Lambdad(keys=["volume"], func = lambda x: torch.tensor(x, dtype=torch.float32).unsqueeze(0).unsqueeze(0)),
     ]
 )
-
 
 LOGGER.info("Loading dataset...")
 dataset_preparation_stopwatch = Stopwatch("Done! Loading the Dataset took: ").start()
@@ -123,19 +114,18 @@ validation_ds = SyntheticLDM100K(
 
 
 train_loader = DataLoader(train_ds, batch_size=run_config["batch_size"], shuffle=True, num_workers=4, drop_last=True, persistent_workers=True)
-valid_loader = DataLoader(validation_ds, batch_size=run_config["batch_size"], shuffle=True, num_workers=4, drop_last=True, persistent_workers=True)
+valid_loader = DataLoader(validation_ds, batch_size=run_config["batch_size"], shuffle=True, num_workers=6, drop_last=True, persistent_workers=True)
 
 dataset_preparation_stopwatch.stop().display()
 
 LOGGER.info(f"Train length: {len(train_ds)} in {len(train_loader)} batches")
 LOGGER.info(f"Valid length: {len(validation_ds)} in {len(valid_loader)} batches")
-LOGGER.info(f'Mask shape {train_ds[0]["mask"].shape}')
+LOGGER.info(f'Image shape {train_ds[0]["image"].shape}')
 
 down_sampling_factor = (2 ** (len(auto_encoder_config["num_channels"]) -1) )
 dim_xyz = tuple(map(lambda x: x // down_sampling_factor, run_config["input_image_crop_roi"]))
 encoding_shape = (run_config["batch_size"], auto_encoder_config["latent_channels"], dim_xyz[0], dim_xyz[1], dim_xyz[2])
 LOGGER.info(f"Encoding shape: {encoding_shape}")
-
 
 # ### Visualise examples from the training set
 iterator = enumerate(train_loader)
@@ -143,33 +133,27 @@ sample_data = None # reused later
 for i in range(3):
     _, sample_data = next(iterator)
     sample_index = 0
-    mask = sample_data["mask"][sample_index, 0].detach().cpu().numpy()
-    image = sample_data["image"][sample_index, 0].detach().cpu().numpy()
-    log_image_with_mask(image, mask, None, None, "trainingdata", sample_data["volume"][sample_index])
+    img = sample_data["image"][sample_index, 0].detach().cpu().numpy()
+    log_image_to_wandb(img, None, "trainingdata", WANDB_LOG_IMAGES, conditioning_information=sample_data["volume"][sample_index].unsqueeze(0))
 
+LOGGER.info(f"Batch image shape: {sample_data['image'].shape}")
 
-LOGGER.info(f"Batch image shape: {sample_data['mask'].shape}")
-
-base_autoencoder = AutoencoderKL(**auto_encoder_config).to(device)
-autoencoder = EmbeddingWrapper(base_autoencoder=base_autoencoder, vocabulary_size=max(synthseg_classes) + 1, embedding_dim=64)
+autoencoder = AutoencoderKL(**auto_encoder_config).to(device)
 
 # Try to load identically trained autoencoder if it already exists. Else train a new one.
-if not load_model_from_run_with_matching_config([run_config, auto_encoder_config, auto_encoder_training_config, patch_discrim_config],
-                                            ["run_config", "auto_encoder_config", "auto_encoder_training_config", "patch_discrim_config"],
-                                            project=project, entity=entity,
-                                            model=autoencoder, artifact_name=autoencoder.__class__.__name__,
+if not load_model_from_run_with_matching_config([auto_encoder_config, auto_encoder_training_config],
+                                            ["auto_encoder_config", "auto_encoder_training_config"],
+                                            project=project, entity=entity, 
+                                            model=autoencoder, artifact_name=AutoencoderKL.__name__,
                                             ):
     LOGGER.info("Training new autoencoder...")
-    trainer = SegmentationEmbeddingAutoencoderTrainer(autoencoder=autoencoder, 
+    trainer = AutoencoderTrainer(autoencoder=autoencoder, 
                                  train_loader=train_loader, val_loader=valid_loader, 
                                  patch_discrim_config=patch_discrim_config, auto_encoder_training_config=auto_encoder_training_config,
                                  WANDB_LOG_IMAGES=WANDB_LOG_IMAGES,
-                                 evaluation_intervall=run_config["evaluation_intervall"],
-                                 starting_epoch=0
-                                 )
-    
-    with Stopwatch("Training took: "):
-        autoencoder = trainer.train()
+                                 evaluation_intervall=run_config["evaluation_intervall"])
+
+    autoencoder = trainer.train()
 
     # clean up fully
     del trainer
@@ -178,42 +162,62 @@ if not load_model_from_run_with_matching_config([run_config, auto_encoder_config
 else:
     LOGGER.info("Loaded existing autoencoder")
 
-with Stopwatch("Evaluating Autoencoder took: "):
-    evaluator = SegmentationMaskAutoencoderEvaluator(autoencoder=autoencoder, val_loader=valid_loader, wandb_prefix="autoencoder/evaluation")
-    evaluator.visualize_batches(5)
-    evaluator.evaluate()
-    del evaluator
+visualize_reconstructions(train_loader, autoencoder, 10)
 
-quit()
 
-unet = DiffusionModelUNet(**diffusion_model_unet_config).to(device)
-scheduler = DDPMScheduler(num_train_timesteps=1000, schedule="scaled_linear_beta", beta_start=0.0015, beta_end=0.0205, clip_sample=False)
+diffusion_model = DiffusionModelUNet(**diffusion_model_unet_config).to(device)
+training_scheduler = DDPMScheduler(num_train_timesteps=1000, schedule="scaled_linear_beta", beta_start=0.0015, beta_end=0.0205, clip_sample=False)
+evaluation_scheduler = DDIMScheduler(
+                          num_train_timesteps=1000,
+                          schedule="scaled_linear_beta",
+                          beta_start=0.0015, 
+                          beta_end=0.0205, 
+                          clip_sample=False)
+evaluation_scheduler.set_timesteps(num_inference_steps=25)
+
 
 # We define the inferer using the scale factor:
 scale_factor = get_scale_factor(autoencoder=autoencoder, sample_data=sample_data["image"].to(device))
-inferer = LatentDiffusionInferer(scheduler, scale_factor=scale_factor)
+inferer = LatentDiffusionInferer(training_scheduler, scale_factor=scale_factor)
 
-optimizer_diff = torch.optim.Adam(params=unet.parameters(), 
+optimizer_diff = torch.optim.Adam(params=diffusion_model.parameters(), 
                                   lr=diffusion_model_training_config["learning_rate"])
 scaler = GradScaler()
 
 LOGGER.info("Training new diffusion model...")
-with Stopwatch("Diffusion training took:"):
-    train_diffusion_model(autoencoder=autoencoder,
-                          unet=unet, 
-                          optimizer_diff=optimizer_diff, 
-                          scaler=scaler, 
-                          inferer=inferer, 
-                          train_loader=train_loader,
-                          valid_loader=valid_loader,
-                          encoding_shape=encoding_shape,
-                          n_epochs=diffusion_model_training_config["n_epochs"],
-                          evaluation_intervall=run_config["evaluation_intervall"])
+
+trainer = DiffusionModelTrainer(autoencoder=autoencoder,
+                      unet=diffusion_model, 
+                      optimizer_diff=optimizer_diff, 
+                      scaler=scaler, 
+                      inferer=inferer, 
+                      train_loader=train_loader,
+                      valid_loader=valid_loader,
+                      encoding_shape=encoding_shape,
+                      diffusion_model_training_config=diffusion_model_training_config,
+                      evaluation_intervall=run_config["evaluation_intervall"],
+                      starting_epoch=0,
+                      evaluation_scheduler=evaluation_scheduler
+                      )
+
+diffusion_model = trainer.train()
 
 LOGGER.info("Saving diffusion model as artifact")
-save_model_as_artifact(wandb_run, unet, type(unet).__name__, diffusion_model_unet_config)
+save_model_as_artifact(wandb_run, diffusion_model, type(diffusion_model).__name__, diffusion_model_unet_config)
 
-LOGGER.info("Sampling from trained diffusion model...")
+evaluator = DiffusionModelEvaluator(
+                 diffusion_model=diffusion_model,
+                 scheduler=training_scheduler,
+                 autoencoder=autoencoder,
+                 latent_shape=encoding_shape,
+                 inferer=inferer,
+                 val_loader=valid_loader,
+                 train_loader=train_loader,
+                 wandb_prefix="diffusion/evaluation",
+                 evaluation_scheduler=evaluation_scheduler, # use high quality sampler for final image samples
+                 )
 
+evaluator.log_samples(5, True)
+evaluator.log_samples(5, False)
 
 wandb.finish()
