@@ -95,6 +95,28 @@ synthseg_class_to_string_map = {
 60:        "right ventral DC",
 }
 
+central_areas_close_to_ventricles = [
+    "left thalamus",
+    "left caudate",
+    "left putamen",
+    "left pallidum",
+    "left hippocampus",
+    "left amygdala",
+    "left accumbens area",
+    "left ventral DC",
+    "right thalamus",
+    "right caudate",
+    "right putamen",
+    "right pallidum",
+    "right hippocampus",
+    "right amygdala",
+    "right accumbens area",
+    "right ventral DC",
+]
+central_areas_close_to_ventricles_indices  = torch.tensor([index for (index, name) in synthseg_class_to_string_map.items() 
+                                                                 if name in central_areas_close_to_ventricles]).to(device)
+assert len(central_areas_close_to_ventricles_indices) == 16
+
 ventricles = [
     "right lateral ventricle",
     "right inferior lateral ventricle",
@@ -103,10 +125,8 @@ ventricles = [
     "3rd ventricle",
     "4th ventricle",
 ]
-
 ventricle_indices  = torch.tensor([index for index, name in synthseg_class_to_string_map.items() 
                                       if name in ventricles]).to(device)
-
 assert len(ventricle_indices) == 6
 
 
@@ -116,18 +136,14 @@ white_matter = [
     "right cerebral white matter",
     "right cerebellum white matter",
 ]
-
 white_matter_indices = torch.tensor([index for index, name in synthseg_class_to_string_map.items() 
                                       if name in white_matter]).to(device)
-
 assert len(white_matter_indices) == 4
 
 
 background = ["background"]
-
 background_indices = torch.tensor([index for index, name in synthseg_class_to_string_map.items() 
                                       if name in background]).to(device)
-
 assert len(background_indices) == 1
 
 cortex = [
@@ -136,17 +152,13 @@ cortex = [
           "left cerebellum cortex",
           "left cerebral cortex",
           ]
-
 cortex_indices = torch.tensor([index for index, name in synthseg_class_to_string_map.items() 
                                       if name in cortex]).to(device)
-
 assert len(cortex_indices) == 4
 
 CSF = ["CSF"]
-
 CSF_indices = torch.tensor([index for index, name in synthseg_class_to_string_map.items() 
                                       if name in CSF]).to(device)
-
 assert len(CSF_indices) == 1
 
 def encode_one_hot(mask: torch.Tensor, device=device):
