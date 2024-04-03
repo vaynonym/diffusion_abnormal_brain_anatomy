@@ -3,6 +3,7 @@ import wandb
 import os
 from src.logging_util import LOGGER
 from src.directory_management import MODEL_DIRECTORY
+from src.util import device
 
 def save_model(model: torch.nn.Module, path: str, optimizer: torch.optim.Optimizer=None):
 
@@ -81,3 +82,59 @@ def check_dimensions(run_config, auto_encoder_config, diffusion_model_unet_confi
             f"image dim {image_dim} must be evenly divisible by autoencoder downsampling factor {down_sample_factor_autoencoder} * diffusion dowmsampling factor {down_sample_factor_diffusion_model}"
 
     LOGGER.info("Image dimensions match downsampling factors! Good to go!")
+
+
+from generative.networks.nets import AutoencoderKL, DiffusionModelUNet
+from src.custom_autoencoders import EmbeddingWrapper
+
+name_to_class_map = {
+    AutoencoderKL.__name__: AutoencoderKL,
+    EmbeddingWrapper.__name__: EmbeddingWrapper,
+    DiffusionModelUNet.__name__: DiffusionModelUNet,
+}
+
+class_to_config_map = {
+    AutoencoderKL.__name__: "auto_encoder_config",
+    EmbeddingWrapper.__name__: "auto_encoder_config",
+    DiffusionModelUNet.__name__: "diffusion_model_unet_config",
+}
+
+def load_model_from_run(run_id, project, entity, model_class, create_model_from_config=None):
+    if create_model_from_config == None:
+        create_model_from_config = model_class
+
+    artifact_name = model_class.__name__
+    
+    run = wandb.Api().run(f"{entity}/{project}/{run_id}")
+
+    
+    fitting_artifacts = [artifact for artifact in run.logged_artifacts() if artifact.name.startswith(artifact_name)]
+
+    if len(fitting_artifacts) != 0:
+        LOGGER.info(f"Found artifact in matching run {run.name}")
+        fitting_artifact = fitting_artifacts[0]
+    else:
+        LOGGER.error(f"No fitting artifact found in run {run.name}")
+        raise f"Could not load model {artifact_name} from {run.name}"
+    
+    file_name = f"{artifact_name}.pth"
+
+    model_weights = fitting_artifact.get_entry(file_name)
+    tmp_path = os.path.join(MODEL_DIRECTORY, "temp")
+    model_weights.download(tmp_path)
+    downloaded_file_path = os.path.join(tmp_path, file_name)
+
+    # create model
+    config_name = class_to_config_map[artifact_name]
+    config = run.config[config_name]
+    model = create_model_from_config(**config).to(device)
+
+    # load weights into model
+    load_model(model, downloaded_file_path)
+    os.remove(downloaded_file_path)
+
+    # have wandb show connection between runs
+    if wandb.run is not None:
+        wandb.use_artifact(fitting_artifact.name)
+
+    return model
