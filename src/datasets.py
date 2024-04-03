@@ -31,6 +31,7 @@ class SyntheticLDM100K(Randomizable, CacheDataset):
         cache_num=sys.maxsize,
         cache_rate=1.0,
         num_workers=0,
+        sorted_by_volume=False
     ):
         if not path.isdir(dataset_path):
             raise ValueError("Root directory root_dir must be a directory.")
@@ -89,6 +90,10 @@ class SyntheticLDM100K(Randomizable, CacheDataset):
         self.datalist = list(map(normalize_volume, self.datalist))
 
         data = self._generate_data_list()
+
+        if sorted_by_volume:
+            data = self._sort_by_volume(data)
+
         super().__init__(
             data,
             transform,
@@ -96,6 +101,10 @@ class SyntheticLDM100K(Randomizable, CacheDataset):
             cache_rate=cache_rate,
             num_workers=num_workers,
         )
+
+    def _sort_by_volume(self, data):
+        sorted(data, key=lambda d: d["volume"])
+        return data
 
     def randomize(self, data=None):
         self.rann = self.R.random()
@@ -119,3 +128,45 @@ class SyntheticLDM100K(Randomizable, CacheDataset):
                 )
             data.append(d)
         return data
+
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from src.logging_util import LOGGER
+import torch
+
+def get_dataloader(data: Dataset, run_config: dict):
+    if run_config["oversample_large_ventricles"]:
+        with torch.no_grad():
+            weights = None
+
+            bins = torch.tensor(np.arange(0, 1.01, 0.1), dtype=torch.float)
+# ensure that every normal value is within 0 to 1 buckets, essentially making [0, 0.1], (0.1, 0.2], ..., (0.9, 1.0], (1.0, 1.1], ...
+            bins[0] = -0.001 
+
+            volumes = torch.tensor([x["volume"][0, 0] for x in data])
+
+
+            # inverse frequency, menaing we value each bin an equal amount
+            hist = torch.histogram(volumes, bins=bins)[0]
+
+            LOGGER.info(f"Histogram per bin: {hist}")
+            weights_per_bin = hist.pow(-1)
+            LOGGER.info(f"Using weights based on ventricular volume ratio per 0.1-wide bin: {weights_per_bin}")
+
+            weights = [weights_per_bin[i - 1] for i in torch.bucketize(volumes.flatten(), boundaries=bins)]
+
+
+            return DataLoader(data, 
+                    batch_size=run_config["batch_size"],
+                    shuffle=False,
+                    num_workers=2,
+                    drop_last=True,
+                    persistent_workers=True,
+                    sampler=WeightedRandomSampler(weights=weights, num_samples=len(data), replacement=True),
+                    )
+    else:
+        return DataLoader(data, 
+                      batch_size=run_config["batch_size"],
+                      shuffle=True,
+                      num_workers=2,
+                      drop_last=True,
+                      persistent_workers=True)
