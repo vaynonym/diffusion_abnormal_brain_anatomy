@@ -30,11 +30,15 @@ def log_image_with_mask(image: np.ndarray,
                         reconstruction_image: np.ndarray = None,
                         reconstruction_mask: np.ndarray = None,
                         description_prefix="",
-                        conditioning_information=Optional[torch.Tensor],
+                        conditioning_information:Optional[torch.Tensor] = None,
+                        class_label:Optional[torch.Tensor] = None
                         ):
 
-    if conditioning_information:
-        conditioning_information = round(conditioning_information.item(), 2)
+    if conditioning_information is not None:
+        conditioning_information = str([round(c, 2) for c in conditioning_information.tolist() ])
+
+    if class_label is not None:
+        class_label = str([round(c, 2) for c in class_label.tolist() ])
 
     data = []
     for name, get_indices in [ 
@@ -49,7 +53,7 @@ def log_image_with_mask(image: np.ndarray,
                                           }
              })
         
-        columns = [name, conditioning_information, input_image]
+        columns = [name, conditioning_information if class_label is None else conditioning_information + " | " + class_label, input_image]
 
         if reconstruction_image is not None and reconstruction_mask is not None:
             side_image = wandb.Image(
@@ -226,4 +230,15 @@ def read_config_from_wandb_run(entity, project, id: str):
                    "auto_encoder_training_config",
                    "diffusion_model_unet_config",
                    "diffusion_model_training_config",]
-    return {k:v.value for k, v in run.config if k in relevant_configs}
+    
+    # map for backwards compatability:
+    compatability_map = {
+        "run_config" : "run",
+        "auto_encoder_config" : "auto_encoder",
+        "patch_discrim_config" : "patch_discrim",
+        "auto_encoder_training_config" : "autoencoder_training",
+        "diffusion_model_unet_config" : "diffusion_model_unet",
+        "diffusion_model_training_config" : "diffusion_model_unet_training",
+    }
+
+    return {compatability_map[k]:v for k, v in run.config.items() if k in relevant_configs}
