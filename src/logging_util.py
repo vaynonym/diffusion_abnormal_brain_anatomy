@@ -1,5 +1,7 @@
 import logging
 from contextlib import contextmanager
+from src.directory_management import OUTPUT_DIRECTORY
+import os.path
 
 def setup_basic_logger():
     LOGGER = logging.getLogger("basic")
@@ -9,7 +11,12 @@ def setup_basic_logger():
         formatter = logging.Formatter("%(asctime)s %(levelname)-8s %(message)s")
         handler.setFormatter(formatter)
         LOGGER.addHandler(handler)
+        filepath = os.path.join(OUTPUT_DIRECTORY, "logfile.txt")
+        file_handler = logging.FileHandler(filepath)
+        file_handler.setFormatter(formatter)
+        LOGGER.addHandler(file_handler)
         LOGGER.setLevel(logging.INFO)
+        LOGGER.info(f"Logger configured to write to {filepath}")
     return LOGGER
 
 LOGGER = setup_basic_logger()
