@@ -8,7 +8,7 @@ from monai.data import DataLoader
 from monai.utils import  set_determinism
 
 from generative.inferers import LatentDiffusionInferer
-from generative.networks.nets import AutoencoderKL, DiffusionModelUNet
+from generative.networks.nets import SPADEAutoencoderKL, SPADEDiffusionModelUNet
 from generative.networks.schedulers import DDPMScheduler, DDIMScheduler
 
 import wandb
@@ -18,6 +18,7 @@ from src.util import load_wand_credentials, read_config, read_config_from_wandb_
 from src.model_util import load_model_from_run_with_matching_config, check_dimensions
 from src.evaluation import MaskDiffusionModelEvaluator
 from src.custom_autoencoders import EmbeddingWrapper
+from src.directory_management import DATA_DIRECTORY
 from src.logging_util import LOGGER
 
 import torch.multiprocessing
@@ -47,9 +48,6 @@ diffusion_model_training_config = experiment_config["diffusion_model_unet_traini
 
 check_dimensions(run_config, auto_encoder_config, diffusion_model_unet_config)
 
-diffusion_model_training_config["classifier_free_guidance"] = 4.0
-
-WANDB_RUN_NAME += " " + str(diffusion_model_training_config["classifier_free_guidance"] )
 
 wandb_run = wandb.init(project=project, entity=entity, name=WANDB_RUN_NAME, 
            config={"run_config": run_config,
@@ -59,6 +57,8 @@ wandb_run = wandb.init(project=project, entity=entity, name=WANDB_RUN_NAME,
                    "diffusion_model_unet_config": diffusion_model_unet_config,
                    "diffusion_model_training_config": diffusion_model_training_config,
                    })
+
+run_config["input_image_downsampling_factors"]=[1.2, 1.07, 1.2]
 
 # for reproducibility purposes set a seed
 set_determinism(42)
@@ -73,25 +73,19 @@ dim_xyz = tuple(map(lambda x: x // down_sampling_factor, run_config["input_image
 encoding_shape = (run_config["batch_size"], auto_encoder_config["latent_channels"], dim_xyz[0], dim_xyz[1], dim_xyz[2])
 LOGGER.info(f"Encoding shape: {encoding_shape}")
 
-from src.synthseg_masks import synthseg_classes
-
-def create_embedding_autoencoder(*args, **kwargs):
-    base_autoencoder = AutoencoderKL(*args, **kwargs)
-    autoencoder = EmbeddingWrapper(base_autoencoder=base_autoencoder, vocabulary_size=max(synthseg_classes) + 1, embedding_dim=64)
-    return autoencoder
-
 from src.model_util import load_model_from_run
+from src.datasets import AbnormalSyntheticMaskDataset
 
 autoencoder = load_model_from_run(run_id=WANDB_AUTOENCODER_RUNID, project=project, entity=entity,
                                   #model_class=AutoencoderKL,
-                                  model_class=EmbeddingWrapper,  
-                                  #create_model_from_config=None,
-                                  create_model_from_config=create_embedding_autoencoder
+                                  model_class=SPADEAutoencoderKL,  
+                                  create_model_from_config=None,
+                                  #create_model_from_config=create_embedding_autoencoder
                                   )
 
 
-unet = load_model_from_run(run_id=WANDB_DIFFUSIONMODEL_RUNID, project=project, entity=entity,
-                                      model_class=DiffusionModelUNet, 
+diffusion_model = load_model_from_run(run_id=WANDB_DIFFUSIONMODEL_RUNID, project=project, entity=entity,
+                                      model_class=SPADEDiffusionModelUNet, 
                                       create_model_from_config=None
                                      )
 
@@ -100,69 +94,59 @@ scheduler = DDPMScheduler(num_train_timesteps=1000, schedule="scaled_linear_beta
 evaluation_scheduler = DDIMScheduler(num_train_timesteps=1000, schedule="scaled_linear_beta", beta_start=0.0015, beta_end=0.0205, clip_sample=False)
 evaluation_scheduler.set_timesteps(50)
 
-# REMOVING SCALING FACTOR FOR SIMPLICITY, MIGHT AFFECT PERFORMANCE
 
 scale_factor = 1.0
-LOGGER.info(f"Scaling factor set to {scale_factor}")
-# -
-
-# We define the inferer using the scale factor:
-
 inferer = LatentDiffusionInferer(scheduler, scale_factor=scale_factor)
 
-dataset = torch.arange(0.75, 2.0, 0.1).unsqueeze(0).repeat(2, 1).flatten().unsqueeze(1).unsqueeze(2)
+from monai import transforms
 
-from torch.utils.data import TensorDataset
+def peek(mask):
+    print(mask.shape)
+    return mask
 
-fake_volume_dataset = TensorDataset(dataset)
 
-def collate(data):
-    volume = torch.stack([x[0] for x in data])
 
-    return {"volume": volume,
-            "image": torch.zeros(image_shape), 
-            "mask": torch.zeros(image_shape)}
+train_transforms = transforms.Compose(
+    [
+        transforms.LoadImaged(keys=["mask"]),
+        transforms.EnsureChannelFirstd(keys=["mask"]),
+        transforms.EnsureTyped(keys=["mask"]),
+        #transforms.Orientationd(keys=["mask", "image"], axcodes="IPL"), # axcodes="RAS"
+        transforms.Spacingd(keys=["mask"], pixdim=run_config["input_image_downsampling_factors"], mode=("nearest")),
+        transforms.CenterSpatialCropd(keys=["mask"], roi_size=run_config["input_image_crop_roi"]),
+        transforms.Lambdad(keys=["volume"], func = lambda x: torch.tensor(x, dtype=torch.float32).unsqueeze(0).unsqueeze(0)),
+    ]
+)
 
-def collate_guidance(data):
-    volume = torch.stack([x[0] for x in data])
-    volume = torch.concat([volume, torch.ones_like(volume)], dim=2)
-    return {"volume": volume,
-            "image": torch.zeros(image_shape), 
-            "mask": torch.zeros(image_shape)}
 
-fake_volume_dataloader = DataLoader(fake_volume_dataset,
-                                    batch_size=run_config["batch_size"],
-                                    shuffle=False, num_workers=2,
-                                    drop_last=True,
-                                    persistent_workers=True,
-                                    collate_fn=collate_guidance if diffusion_model_training_config["classifier_free_guidance"] else collate
-                                    )
+dataset = AbnormalSyntheticMaskDataset(
+    dataset_path=os.path.join(DATA_DIRECTORY, "abnormal_masks"),
+    section="training",
+    val_frac=0.0,
+    size=8,
+    cache_rate=1.0,  # you may need a few Gb of RAM... Set to 0 otherwise
+    num_workers=2,
+    seed=0,
+    transform=train_transforms,
+)
 
-autoencoder.eval()
+train_loader = DataLoader(dataset, batch_size=run_config["batch_size"], shuffle=True, num_workers=2, persistent_workers=True, drop_last=True)
 
-MaskDiffusionModelEvaluator(
-                 diffusion_model=unet,
+LOGGER.info(f"mask shape: {iter(train_loader).__next__()['mask'].shape}")
+
+from src.evaluation import SpadeDiffusionModelEvaluator
+
+evaluator = SpadeDiffusionModelEvaluator(
+                 diffusion_model=diffusion_model,
                  autoencoder=autoencoder,
                  latent_shape=encoding_shape,
                  inferer=inferer,
-                 val_loader=fake_volume_dataloader,
-                 train_loader=fake_volume_dataloader,
-                 wandb_prefix="abnormal_mask/DDIM",
+                 val_loader=train_loader,
+                 train_loader=train_loader,
+                 wandb_prefix="diffusion/evaluation",
                  evaluation_scheduler=evaluation_scheduler,
-                 ).log_samples(500, True)
-
-MaskDiffusionModelEvaluator(
-                 diffusion_model=unet,
-                 autoencoder=autoencoder,
-                 latent_shape=encoding_shape,
-                 inferer=inferer,
-                 val_loader=fake_volume_dataloader,
-                 train_loader=fake_volume_dataloader,
-                 wandb_prefix="abnormal_mask/DDPM",
-                 evaluation_scheduler=evaluation_scheduler,
-                 ).log_samples(500, False)
+                 guidance=CLASSIFIER_FREE_GUIDANCE
+                 )
+evaluator.log_samples(8, False)
 
 
-# ## Clean-up data
-
-wandb.finish()
