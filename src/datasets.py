@@ -170,3 +170,91 @@ def get_dataloader(data: Dataset, run_config: dict):
                       num_workers=2,
                       drop_last=True,
                       persistent_workers=True)
+
+
+
+
+class AbnormalSyntheticMaskDataset(Randomizable, CacheDataset):
+    OVERVIEW_FILENAME = "overview.tsv"
+
+    def __init__(
+        self,
+        dataset_path,
+        section,
+        transform,
+        seed=0,
+        size=1000,
+        val_frac=0.2,
+        test_frac=0.0,
+        cache_num=sys.maxsize,
+        cache_rate=1.0,
+        num_workers=0,
+        sorted_by_volume=False
+    ):
+        if not path.isdir(dataset_path):
+            raise ValueError("Root directory root_dir must be a directory.")
+        self.section = section
+        self.val_frac = val_frac
+        self.test_frac = test_frac
+        self.set_random_state(seed=seed)
+
+        self.datalist = []
+        with open(path.join(dataset_path, "overview.tsv"), "r") as participantsCSV:
+            reader = csv.reader(participantsCSV, delimiter='\t')
+            next(reader) # skip header row
+            count = 0
+            for line in reader:
+                sub_folder_name = line[0]
+                volume_value = float(line[1])
+                mask_file_name = sub_folder_name + ".nii.gz"
+
+
+                mask_path = path.join(dataset_path, "data", mask_file_name)
+
+                self.datalist.append({
+                    "mask": mask_path,
+                    "volume": volume_value
+                })
+                count += 1
+                if count >= size:
+                    break
+
+        data = self._generate_data_list()
+
+        if sorted_by_volume:
+            data = self._sort_by_volume(data)
+
+        super().__init__(
+            data,
+            transform,
+            cache_num=cache_num,
+            cache_rate=cache_rate,
+            num_workers=num_workers,
+        )
+
+    def _sort_by_volume(self, data):
+        sorted(data, key=lambda d: d["volume"])
+        return data
+
+    def randomize(self, data=None):
+        self.rann = self.R.random()
+
+    def _generate_data_list(self):
+        data = []
+        for d in self.datalist:
+            self.randomize()
+            if self.section == "training":
+                if self.rann < self.val_frac + self.test_frac:
+                    continue
+            elif self.section == "validation":
+                if self.rann >= self.val_frac:
+                    continue
+            elif self.section == "test":
+                if self.rann < self.val_frac or self.rann >= self.val_frac + self.test_frac:
+                    continue
+            else:
+                raise ValueError(
+                    f"Unsupported section: {self.section}, " "available options are ['training', 'validation', 'test']."
+                )
+            data.append(d)
+        return data
