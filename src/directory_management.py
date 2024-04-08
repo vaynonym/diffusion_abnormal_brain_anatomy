@@ -1,7 +1,5 @@
 import os
-from src.logging_util import LOGGER
 
-LOGGER.info("Reading directory information from environment...")
 PRETRAINED_MODEL_DIRECTORY = os.environ.get("PRETRAINED_MODEL_DIRECTORY")
 DATA_DIRECTORY = os.environ.get("DATA_DIRECTORY")
 BASE_DIRECTORY = os.environ.get("BASE_DIRECTORY")
