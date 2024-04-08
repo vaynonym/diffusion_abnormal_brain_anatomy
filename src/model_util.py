@@ -84,19 +84,23 @@ def check_dimensions(run_config, auto_encoder_config, diffusion_model_unet_confi
     LOGGER.info("Image dimensions match downsampling factors! Good to go!")
 
 
-from generative.networks.nets import AutoencoderKL, DiffusionModelUNet
+from generative.networks.nets import AutoencoderKL, DiffusionModelUNet, SPADEAutoencoderKL, SPADEDiffusionModelUNet
 from src.custom_autoencoders import EmbeddingWrapper
 
 name_to_class_map = {
     AutoencoderKL.__name__: AutoencoderKL,
+    SPADEAutoencoderKL.__name__: SPADEAutoencoderKL,
     EmbeddingWrapper.__name__: EmbeddingWrapper,
     DiffusionModelUNet.__name__: DiffusionModelUNet,
+    SPADEDiffusionModelUNet.__name__: SPADEDiffusionModelUNet,
 }
 
 class_to_config_map = {
     AutoencoderKL.__name__: "auto_encoder_config",
+    SPADEAutoencoderKL.__name__: "auto_encoder_config",
     EmbeddingWrapper.__name__: "auto_encoder_config",
     DiffusionModelUNet.__name__: "diffusion_model_unet_config",
+    SPADEDiffusionModelUNet.__name__: "diffusion_model_unet_config",
 }
 
 def load_model_from_run(run_id, project, entity, model_class, create_model_from_config=None):
@@ -115,7 +119,7 @@ def load_model_from_run(run_id, project, entity, model_class, create_model_from_
         fitting_artifact = fitting_artifacts[0]
     else:
         LOGGER.error(f"No fitting artifact found in run {run.name}")
-        raise f"Could not load model {artifact_name} from {run.name}"
+        raise Exception(f"Could not load model {artifact_name} from {run.name}")
     
     file_name = f"{artifact_name}.pth"
 
