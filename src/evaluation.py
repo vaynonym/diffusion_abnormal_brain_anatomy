@@ -1,10 +1,11 @@
 from generative.metrics import FIDMetric, MMDMetric, MultiScaleSSIMMetric, SSIMMetric
+from monai.data import DataLoader
 from monai.networks.nets.resnet import resnet50
 
 import wandb
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, RandomSampler, ConcatDataset
+from torch.utils.data import DataLoader, RandomSampler, ConcatDataset, TensorDataset
 from torch import Tensor
 import torch.nn.functional as F
 from torchmetrics.classification import Dice
@@ -250,6 +251,7 @@ class DiffusionModelEvaluator():
 
         self.load_feature_extraction_model()
     
+    @torch.no_grad()
     def load_feature_extraction_model(self):
         weights_path = os.path.join(PRETRAINED_MODEL_DIRECTORY, "resnet_50.pth")
         assert os.path.exists(weights_path)
@@ -273,7 +275,9 @@ class DiffusionModelEvaluator():
             state_dict_without_data_parallel[name] = v
 
         self.feature_extraction_model.load_state_dict(state_dict_without_data_parallel)
+        self.feature_extraction_model.eval()
     
+    @torch.no_grad()
     def medicalNetNormalize(self, img):
         return nn.functional.interpolate(
             (img - img.mean(dim=(1,2,3,4), keepdim=True)) / img.std(dim=(1,2,3,4), keepdim=True),
@@ -281,8 +285,9 @@ class DiffusionModelEvaluator():
             )
     
     def get_input_from_batch(self, batch: dict) -> dict:
-        return  { "inputs": batch["mask"].int().to(device)}
+        return  { "inputs": batch["image"].to(device)}
     
+    @torch.no_grad()
     def get_real_features(self, dataloader: DataLoader):
         real_features = []
         for i, batch in enumerate(dataloader):
@@ -302,6 +307,7 @@ class DiffusionModelEvaluator():
         
         return torch.vstack(real_features)
     
+    @torch.no_grad()
     def get_additional_input_from_batch(self, batch) -> dict:
         output = {"conditioning": batch["volume"].to(device)
                 }
@@ -322,6 +328,7 @@ class DiffusionModelEvaluator():
                                    autoencoder_model=self.autoencoder,
                                    diffusion_model=self.diffusion_model,
                                    scheduler=scheduler,
+                                   verbose=False,
                                    **additional_inputs)
         else:
             # remains constant over time, hence we can double here
@@ -347,6 +354,7 @@ class DiffusionModelEvaluator():
 
             return self.autoencoder.decode_stage_2_outputs(latent_noise / self.inferer.scale_factor)
     
+    @torch.no_grad()
     def image_preprocessing(self, image):
         with torch.no_grad():
             image = torch.clamp(image, 0, 1)
@@ -355,6 +363,7 @@ class DiffusionModelEvaluator():
         
         return image
     
+    @torch.no_grad()
     def get_synthetic_features(self, count):
         batch_size = self.latent_shape[0]
         synth_features = []
@@ -363,9 +372,9 @@ class DiffusionModelEvaluator():
             # Get the real images
 
             # Generate some synthetic images using the defined model
-            synthetic_images=self.get_synthetic_output(batch, True)
-
             with torch.no_grad():
+                synthetic_images=self.get_synthetic_output(batch, True)
+
                 synthetic_images = self.medicalNetNormalize(self.image_preprocessing(synthetic_images))
 
                 # Get the features for the synthetic data
@@ -378,7 +387,7 @@ class DiffusionModelEvaluator():
 
         return torch.vstack(synth_features)
     
-
+    @torch.no_grad()
     def calculate_diversity_metrics(self, count):
 
         batch_size_multiplier = 1
@@ -413,6 +422,8 @@ class DiffusionModelEvaluator():
                                  self.image_preprocessing(synthetic_images[idx_b].unsqueeze(0)))
                     if(len(res.size()) == 0):
                         res = res.unsqueeze(0)
+                    if(len(res.size()) == 1):
+                        res = res.unsqueeze(0)
                     scores.append(res)
                 
                 current_count += 1
@@ -435,6 +446,7 @@ class DiffusionModelEvaluator():
         return results
 
     # fid is calculated on train dataset
+    @torch.no_grad()
     def calculate_fid(self):
         real_features = self.get_real_features(self.val_loader)
         synthetic_features = self.get_synthetic_features(100)
@@ -442,19 +454,20 @@ class DiffusionModelEvaluator():
         fid = FIDMetric()(synthetic_features, real_features)
         return fid
     
+    @torch.no_grad()
     def evaluate(self):
-        with torch.no_grad():
-            self.autoencoder.eval()
-            self.diffusion_model.eval()
-            with Stopwatch("FID took: "):
-                fid = self.calculate_fid()
-            results = {f"{self.wandb_prefix}/FID": fid.item()}
-            with Stopwatch("Diversity metrics took: "):
-                diversity_metrics = self.calculate_diversity_metrics(100)
+        self.autoencoder.eval()
+        self.diffusion_model.eval()
+        with Stopwatch("FID took: "):
+            fid = self.calculate_fid()
+        results = {f"{self.wandb_prefix}/FID": fid.item()}
+        with Stopwatch("Diversity metrics took: "):
+            diversity_metrics = self.calculate_diversity_metrics(100)
 
         results.update(diversity_metrics)
         wandb.log(results)
     
+    @torch.no_grad()
     def log_samples(self, count, use_evaluation_scheduler=False):
         self.autoencoder.eval()
         self.diffusion_model.eval()
@@ -511,6 +524,8 @@ class MaskDiffusionModelEvaluator(DiffusionModelEvaluator):
             ("Pairwise Dice", lambda x, y: self.metric_Dice(x.argmax(dim=1), y.argmax(dim=1))),
         }
 
+    def get_input_from_batch(self, batch: dict) -> dict:
+        return  { "inputs": batch["mask"].int().to(device)}
 
     def image_preprocessing(self, image):
         with torch.no_grad():
@@ -613,6 +628,7 @@ class SpadeDiffusionModelEvaluator(DiffusionModelEvaluator):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
+    @torch.no_grad()
     def get_additional_input_from_batch(self, batch) -> dict:
         output = {"seg": encode_one_hot(batch["mask"].to(device))}
 
@@ -621,12 +637,14 @@ class SpadeDiffusionModelEvaluator(DiffusionModelEvaluator):
         
         return output
     
+    @torch.no_grad()
     def mask_preprocessing(self, image):
         if self.crop_to_ventricles is not None:
             image = self.crop_to_ventricles(image)
         
         return image
-    
+
+    @torch.no_grad()
     def log_samples(self, count, use_evaluation_scheduler=False):
         self.autoencoder.eval()
         self.diffusion_model.eval()
@@ -644,12 +662,17 @@ class SpadeDiffusionModelEvaluator(DiffusionModelEvaluator):
             # ### Visualise synthetic data
             for batch_index in range(batch_size):
                 synth_image = self.image_preprocessing(synthetic_images[batch_index, 0]).detach().cpu().numpy()  # images
-                original_image = self.image_preprocessing(reduced_batch["image"][batch_index, 0]).detach().cpu().numpy()
+                if "image" in reduced_batch:
+                    original_image = self.image_preprocessing(reduced_batch["image"][batch_index, 0]).detach().cpu().numpy()
+                else:
+                    original_image = torch.zeros_like(synthetic_images[batch_index, 0]).detach().cpu().numpy()
+
                 mask = self.mask_preprocessing(reduced_batch["mask"][batch_index, 0]).detach().cpu().numpy()
 
                 if "volume" in reduced_batch.keys():
                     volume = reduced_batch["volume"][batch_index, 0].detach().cpu()
 
+                class_label = None
                 if "class_labels" in batch.keys():
                     class_label = reduced_batch["class_labels"][batch_index, 0].detach().cpu()
                 
@@ -668,3 +691,36 @@ class SpadeDiffusionModelEvaluator(DiffusionModelEvaluator):
                 break
 
         self.latent_shape = old_latent_shape
+
+
+def create_fake_volume_dataloader(min_val, max_val, bucket_size, number_samples_per_bucket, classifier_free_guidance, batch_size, image_shape: Optional[torch.Size] = None):
+    
+    dataset = torch.arange(min_val, max_val, bucket_size).unsqueeze(0).repeat(number_samples_per_bucket, 1).flatten().unsqueeze(1).unsqueeze(2)
+
+    def collate(data):
+        volume = torch.stack([x[0] for x in data])
+        d = {"volume": volume}
+        if image_shape is not None:
+            d["image"] = torch.zeros(image_shape), 
+            d["mask"] = torch.zeros(image_shape)
+        return d
+
+    def collate_guidance(data):
+        volume = torch.stack([x[0] for x in data])
+        volume = torch.concat([volume, torch.ones_like(volume)], dim=2)
+        d = {"volume": volume}
+        if image_shape is not None:
+            d["image"] = torch.zeros(image_shape), 
+            d["mask"] = torch.zeros(image_shape)
+        return d
+
+    fake_volume_dataset = TensorDataset(dataset)
+
+    fake_volume_dataloader = DataLoader(fake_volume_dataset,
+                                        batch_size=batch_size,
+                                        shuffle=True, num_workers=2,
+                                        drop_last=True,
+                                        persistent_workers=True,
+                                        collate_fn=collate_guidance if classifier_free_guidance is not None else collate)
+
+    return fake_volume_dataloader
