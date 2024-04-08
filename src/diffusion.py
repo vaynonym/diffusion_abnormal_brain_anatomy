@@ -22,7 +22,7 @@ from monai.transforms import CenterSpatialCrop, SpatialPad
 
 from generative.networks.nets import SPADEAutoencoderKL, SPADEDiffusionModelUNet
 
-def get_scale_factor(autoencoder: IAutoencoder, sample_data: torch.Tensor) -> torch.Tensor:
+def get_scale_factor(autoencoder: IAutoencoder, sample_data: torch.Tensor, is_mask=True) -> torch.Tensor:
     # ### Scaling factor
     #
     # As mentioned in Rombach et al. [1] Section 4.3.2 and D.1, the signal-to-noise ratio (induced by the scale of the latent space) can affect the results obtained with the LDM, if the standard deviation of the latent space distribution drifts too much from that of a Gaussian. For this reason, it is best practice to use a scaling factor to adapt this standard deviation.
@@ -30,8 +30,11 @@ def get_scale_factor(autoencoder: IAutoencoder, sample_data: torch.Tensor) -> to
     # _Note: In case where the latent space is close to a Gaussian distribution, the scaling factor will be close to one, and the results will not differ from those obtained when it is not used._
     #
     # +
-    if isinstance(autoencoder, AutoencoderKL):
-        sample_data = encode_one_hot(sample_data)
+    if isinstance(autoencoder, AutoencoderKL) or isinstance(autoencoder, SPADEAutoencoderKL):
+        if is_mask:
+            sample_data = encode_one_hot(sample_data)
+        else:
+            sample_data = sample_data
     elif isinstance(autoencoder, EmbeddingWrapper):
         sample_data = sample_data.int()
     else:
