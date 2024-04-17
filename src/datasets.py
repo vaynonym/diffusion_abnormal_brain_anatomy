@@ -17,6 +17,19 @@ VENTRICLE_KEYS = [
     
 BRAIN_SIZE_KEY = "total intracranial"
 
+def normalize_volumes(volumes, datalist):
+    def normalize(x, min_x, max_x):
+        return (x -  min_x) / (max_x - min_x)
+    
+    max_volume = np.max(volumes)
+    min_volume = np.min(volumes)
+
+    def normalize_volume(d):
+        d["volume"] = normalize(d["volume"], min_volume, max_volume)
+        return d
+
+    return list(map(normalize_volume, datalist))
+
 class SyntheticLDM100K(Randomizable, CacheDataset):
 
     def __init__(
@@ -31,7 +44,8 @@ class SyntheticLDM100K(Randomizable, CacheDataset):
         cache_num=sys.maxsize,
         cache_rate=1.0,
         num_workers=0,
-        sorted_by_volume=False
+        sorted_by_volume=False,
+        filter_function=None,
     ):
         if not path.isdir(dataset_path):
             raise ValueError("Root directory root_dir must be a directory.")
@@ -76,22 +90,17 @@ class SyntheticLDM100K(Randomizable, CacheDataset):
                 if count >= size:
                     break
         
-        
-        def normalize(x, min_x, max_x):
-            return (x -  min_x) / (max_x - min_x)
-        
-        max_volume = np.max(volumes)
-        min_volume = np.min(volumes)
 
-        def normalize_volume(d):
-            d["volume"] = normalize(d["volume"], min_volume, max_volume)
-            return d
+        self.datalist = normalize_volumes(volumes, self.datalist)
 
-        self.datalist = list(map(normalize_volume, self.datalist))
+        if filter_function is not None:
+            LOGGER.info("Filtering dataset...")
+            self.datalist = list(filter(filter_function, self.datalist))
 
         data = self._generate_data_list()
 
         if sorted_by_volume:
+            LOGGER.info("Sorting the dataset...")
             data = self._sort_by_volume(data)
 
         super().__init__(
@@ -218,6 +227,167 @@ class AbnormalSyntheticMaskDataset(Randomizable, CacheDataset):
                 count += 1
                 if count >= size:
                     break
+
+        data = self._generate_data_list()
+
+        if sorted_by_volume:
+            data = self._sort_by_volume(data)
+
+        super().__init__(
+            data,
+            transform,
+            cache_num=cache_num,
+            cache_rate=cache_rate,
+            num_workers=num_workers,
+        )
+
+    def _sort_by_volume(self, data):
+        sorted(data, key=lambda d: d["volume"])
+        return data
+
+    def randomize(self, data=None):
+        self.rann = self.R.random()
+
+    def _generate_data_list(self):
+        data = []
+        for d in self.datalist:
+            self.randomize()
+            if self.section == "training":
+                if self.rann < self.val_frac + self.test_frac:
+                    continue
+            elif self.section == "validation":
+                if self.rann >= self.val_frac:
+                    continue
+            elif self.section == "test":
+                if self.rann < self.val_frac or self.rann >= self.val_frac + self.test_frac:
+                    continue
+            else:
+                raise ValueError(
+                    f"Unsupported section: {self.section}, " "available options are ['training', 'validation', 'test']."
+                )
+            data.append(d)
+        return data
+
+
+import os
+import json
+import pprint
+
+
+class RHFlairDataset(Randomizable, CacheDataset):
+
+    mask_file_path = "FLAIR_synthseg.nii.gz"
+    image_file_path = "FLAIR.nii.gz"
+    json_path = "FLAIR.json"
+    volumes_csv_path = "FLAIR_synthseg_volumes.csv"
+
+    overview_file_name = "overview.txt"
+
+    def __init__(
+        self,
+        dataset_path,
+        section,
+        transform,
+        seed=0,
+        size=1000,
+        val_frac=0.2,
+        test_frac=0.0,
+        cache_num=sys.maxsize,
+        cache_rate=1.0,
+        num_workers=0,
+        sorted_by_volume=False
+    ):
+        if not path.isdir(dataset_path):
+            raise ValueError("Root directory root_dir must be a directory.")
+        self.section = section
+        self.val_frac = val_frac
+        self.test_frac = test_frac
+        self.set_random_state(seed=seed)
+
+        self.datalist = []
+
+        skipped_because_of_volumes = []
+        skipped_because_2D = []
+        skipped_because_no_info_about_acquisition_type = []
+        too_many_volumes = []
+        MRAcquisitionType = set()
+
+        good_scan_paths = []
+
+        volumes = []
+        import tqdm
+
+        for rel_patient_path in tqdm.tqdm(os.listdir(dataset_path)):
+            patient_path = os.path.join(dataset_path, rel_patient_path)
+            for rel_scan_path in os.listdir(patient_path):
+                scan_path = os.path.join(patient_path, rel_scan_path)
+
+                image_file = os.path.join(scan_path, RHFlairDataset.image_file_path)
+                mask_file = os.path.join(scan_path, RHFlairDataset.mask_file_path)
+                json_file = os.path.join(scan_path, RHFlairDataset.json_path)
+                volumes_file = os.path.join(scan_path, RHFlairDataset.volumes_csv_path)
+
+                with open(json_file) as f:
+                    json_f = json.load(f)
+                    if not "MRAcquisitionType" in json_f:
+                        skipped_because_no_info_about_acquisition_type.append(scan_path)
+                    elif json_f["MRAcquisitionType"] == "2D":
+                        skipped_because_2D.append(scan_path)
+                        continue
+                    else:
+                        MRAcquisitionType.add(json_f["MRAcquisitionType"])
+
+                volume_df = pd.read_csv(volumes_file)
+                assert (volume_df["subject"] == "FLAIR").all()
+                volume_df = volume_df.drop("subject", axis=1)
+                if volume_df.shape[0] != 1:
+                    too_many_volumes.append(scan_path)
+                    continue
+
+                assert volume_df.shape[0] == 1, "CSV should contain only one entry"
+
+                if volume_df.isna().values.any() or volume_df.values.astype(float).__le__(10).any():
+                    skipped_because_of_volumes.append(scan_path)
+                    continue
+
+
+                # sum over ventricle columns
+                ventricle_volume = volume_df[VENTRICLE_KEYS].sum(axis=1)[0]
+                brain_volume = volume_df[BRAIN_SIZE_KEY][0]
+
+                relative_volume = ventricle_volume/brain_volume
+
+                good_scan_paths.append(scan_path)
+
+                self.datalist.append({
+                    "image": image_file,
+                    "mask": mask_file,
+                    "volume": relative_volume
+                })
+                volumes.append(relative_volume)
+
+        self.datalist = normalize_volumes(volumes, self.datalist)  
+
+        #LOGGER.warning(f"skipped_because_2D={pprint.pformat(skipped_because_2D)}")
+        #LOGGER.warning(f"skipped_because_of_volumes={pprint.pformat(skipped_because_of_volumes)}")
+        #LOGGER.warning(f"skipped_because_no_info_about_acquisition_type={pprint.pformat(skipped_because_no_info_about_acquisition_type)}")
+        #LOGGER.warning(f"too_many_volumes={pprint.pformat(too_many_volumes)}")
+
+
+        LOGGER.warning(f"skipped_because_2D={len(skipped_because_2D)}")
+        LOGGER.warning(f"skipped_because_of_volumes={len(skipped_because_of_volumes)}")
+        LOGGER.warning(f"skipped_because_no_info_about_acquisition_type={len(skipped_because_no_info_about_acquisition_type)}")
+        LOGGER.warning(f"too_many_volumes={len(too_many_volumes)}")
+        LOGGER.info(f"Acquisition Types Used: {MRAcquisitionType}")
+
+        LOGGER.info(f"Good scans: {len(good_scan_paths)}")
+
+        from src.directory_management import OUTPUT_DIRECTORY
+
+        with open(os.path.join(OUTPUT_DIRECTORY, "RH_3D_subset_paths"), 'w') as f:
+            for scan_path in good_scan_paths:
+                f.write(scan_path)
+                f.write("\n")
 
         data = self._generate_data_list()
 
