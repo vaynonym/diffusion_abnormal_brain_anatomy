@@ -281,15 +281,13 @@ class RHFlairDataset(Randomizable, CacheDataset):
     json_path = "FLAIR.json"
     volumes_csv_path = "FLAIR_synthseg_volumes.csv"
 
-    overview_file_name = "overview.txt"
-
     def __init__(
         self,
         dataset_path,
         section,
         transform,
         seed=0,
-        size=1000,
+        size=7000,
         val_frac=0.2,
         test_frac=0.0,
         cache_num=sys.maxsize,
@@ -306,10 +304,10 @@ class RHFlairDataset(Randomizable, CacheDataset):
 
         self.datalist = []
 
-        skipped_because_of_volumes = []
-        skipped_because_2D = []
-        skipped_because_no_info_about_acquisition_type = []
-        too_many_volumes = []
+        #skipped_because_of_volumes = []
+        #skipped_because_2D = []
+        #skipped_because_no_info_about_acquisition_type = []
+        #too_many_volumes = []
         MRAcquisitionType = set()
 
         good_scan_paths = []
@@ -317,7 +315,7 @@ class RHFlairDataset(Randomizable, CacheDataset):
         volumes = []
         import tqdm
 
-        for rel_patient_path in tqdm.tqdm(os.listdir(dataset_path)):
+        for rel_patient_path in tqdm.tqdm(os.listdir(dataset_path), desc="Collecting files and volumes..."):
             patient_path = os.path.join(dataset_path, rel_patient_path)
             for rel_scan_path in os.listdir(patient_path):
                 scan_path = os.path.join(patient_path, rel_scan_path)
@@ -330,9 +328,10 @@ class RHFlairDataset(Randomizable, CacheDataset):
                 with open(json_file) as f:
                     json_f = json.load(f)
                     if not "MRAcquisitionType" in json_f:
-                        skipped_because_no_info_about_acquisition_type.append(scan_path)
+                        #skipped_because_no_info_about_acquisition_type.append(scan_path)
+                        continue
                     elif json_f["MRAcquisitionType"] == "2D":
-                        skipped_because_2D.append(scan_path)
+                        #skipped_because_2D.append(scan_path)
                         continue
                     else:
                         MRAcquisitionType.add(json_f["MRAcquisitionType"])
@@ -340,14 +339,16 @@ class RHFlairDataset(Randomizable, CacheDataset):
                 volume_df = pd.read_csv(volumes_file)
                 assert (volume_df["subject"] == "FLAIR").all()
                 volume_df = volume_df.drop("subject", axis=1)
+
                 if volume_df.shape[0] != 1:
-                    too_many_volumes.append(scan_path)
-                    continue
+                    #too_many_volumes.append(scan_path)
+                    # Use the first row (rows are equivalent)
+                    volume_df = volume_df.drop(volume_df.index[range(1, volume_df.shape[0])], axis=0)
 
                 assert volume_df.shape[0] == 1, "CSV should contain only one entry"
 
                 if volume_df.isna().values.any() or volume_df.values.astype(float).__le__(10).any():
-                    skipped_because_of_volumes.append(scan_path)
+                    #skipped_because_of_volumes.append(scan_path)
                     continue
 
 
@@ -357,14 +358,18 @@ class RHFlairDataset(Randomizable, CacheDataset):
 
                 relative_volume = ventricle_volume/brain_volume
 
-                good_scan_paths.append(scan_path)
-
                 self.datalist.append({
                     "image": image_file,
+                    "image_path": image_file,
                     "mask": mask_file,
+                    "mask_path": mask_file,
                     "volume": relative_volume
                 })
                 volumes.append(relative_volume)
+
+                if len(self.datalist) >= size: break
+            if len(self.datalist) >= size: break
+
 
         self.datalist = normalize_volumes(volumes, self.datalist)  
 
@@ -374,20 +379,20 @@ class RHFlairDataset(Randomizable, CacheDataset):
         #LOGGER.warning(f"too_many_volumes={pprint.pformat(too_many_volumes)}")
 
 
-        LOGGER.warning(f"skipped_because_2D={len(skipped_because_2D)}")
-        LOGGER.warning(f"skipped_because_of_volumes={len(skipped_because_of_volumes)}")
-        LOGGER.warning(f"skipped_because_no_info_about_acquisition_type={len(skipped_because_no_info_about_acquisition_type)}")
-        LOGGER.warning(f"too_many_volumes={len(too_many_volumes)}")
-        LOGGER.info(f"Acquisition Types Used: {MRAcquisitionType}")
+        #LOGGER.warning(f"skipped_because_2D={len(skipped_because_2D)}")
+        #LOGGER.warning(f"skipped_because_of_volumes={len(skipped_because_of_volumes)}")
+        #LOGGER.warning(f"skipped_because_no_info_about_acquisition_type={len(skipped_because_no_info_about_acquisition_type)}")
+        #LOGGER.warning(f"too_many_volumes={len(too_many_volumes)}")
+        LOGGER.info(f"Acquisition Types used: {MRAcquisitionType}")
 
-        LOGGER.info(f"Good scans: {len(good_scan_paths)}")
+        #from src.directory_management import OUTPUT_DIRECTORY
 
-        from src.directory_management import OUTPUT_DIRECTORY
+        #with open(os.path.join(OUTPUT_DIRECTORY, "RH_3D_subset_paths"), 'w') as f:
+        #    for scan_path in good_scan_paths:
+        #        f.write(scan_path)
+        #        f.write("\n")
 
-        with open(os.path.join(OUTPUT_DIRECTORY, "RH_3D_subset_paths"), 'w') as f:
-            for scan_path in good_scan_paths:
-                f.write(scan_path)
-                f.write("\n")
+        
 
         data = self._generate_data_list()
 
