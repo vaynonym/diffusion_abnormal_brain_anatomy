@@ -5,6 +5,14 @@ import pandas as pd
 import sys
 import csv
 import numpy as np
+from src.directory_management import DATA_DIRECTORY
+from monai import transforms
+from src.transforms import get_crop_around_mask_center
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from src.logging_util import LOGGER
+import torch
+import random
+
 
 VENTRICLE_KEYS = [
     "left lateral ventricle",
@@ -17,20 +25,36 @@ VENTRICLE_KEYS = [
     
 BRAIN_SIZE_KEY = "total intracranial"
 
-def normalize_volumes(volumes, datalist):
+def normalize_volumes(volumes, datalist, max_volume = None, min_volume = None):
     def normalize(x, min_x, max_x):
         return (x -  min_x) / (max_x - min_x)
     
-    max_volume = np.max(volumes)
-    min_volume = np.min(volumes)
+    if max_volume is None:
+        max_volume = np.max(volumes)
+    if min_volume is None:
+        min_volume = np.min(volumes)
 
     def normalize_volume(d):
         d["volume"] = normalize(d["volume"], min_volume, max_volume)
+        if d["volume"] > 1.000001:
+            LOGGER.warn(f"Normalized volume > 1.0 found: {d["volume"]}")
         return d
 
-    return list(map(normalize_volume, datalist))
+    return list(map(normalize_volume, datalist)), max_volume, min_volume
 
-class SyntheticLDM100K(Randomizable, CacheDataset):
+class VolumeDataset():
+
+    def analyze_raw_volumes(self):
+        raw_volumes = np.array(list(map(lambda d: d["volume"], self.datalist)))
+
+        LOGGER.info("==== Raw volume statistics ====")
+        LOGGER.info(f"Max: {raw_volumes.max()}")
+        LOGGER.info(f"Min: {raw_volumes.min()}")
+        LOGGER.info(f"Mean: {raw_volumes.mean()}")
+        LOGGER.info(f"Std: {raw_volumes.std()}")
+        LOGGER.info("===============================")
+
+class SyntheticLDM100K(Randomizable, CacheDataset, VolumeDataset):
 
     def __init__(
         self,
@@ -46,6 +70,9 @@ class SyntheticLDM100K(Randomizable, CacheDataset):
         num_workers=0,
         sorted_by_volume=False,
         filter_function=None,
+        display_statistics=False,
+        max_volume=None,
+        min_volume=None,
     ):
         if not path.isdir(dataset_path):
             raise ValueError("Root directory root_dir must be a directory.")
@@ -56,6 +83,8 @@ class SyntheticLDM100K(Randomizable, CacheDataset):
 
         self.datalist = []
         volumes = []
+
+        tsv_volumes = []
         with open(path.join(dataset_path, "participants.tsv"), "r") as participantsCSV:
             reader = csv.reader(participantsCSV, delimiter='\t')
             next(reader) # skip header row
@@ -80,6 +109,11 @@ class SyntheticLDM100K(Randomizable, CacheDataset):
 
                 relative_volume = ventricle_volume/brain_volume
 
+                tsv_ventricle_volume = float(line[3])
+                tsv_brain_volume = float(line[4])
+                tsv_volumes.append(tsv_ventricle_volume / tsv_brain_volume)
+
+
                 self.datalist.append({
                     "image": image_path,
                     "mask": mask_path,
@@ -90,12 +124,24 @@ class SyntheticLDM100K(Randomizable, CacheDataset):
                 if count >= size:
                     break
         
-
-        self.datalist = normalize_volumes(volumes, self.datalist)
+        if display_statistics:
+            self.analyze_raw_volumes()
+        
+        tsv_array = np.array(tsv_volumes)
+        LOGGER.info("==== Raw TSV volume statistics ====")
+        LOGGER.info(f"Max: {tsv_array.max()}")
+        LOGGER.info(f"Min: {tsv_array.min()}")
+        LOGGER.info(f"Mean: {tsv_array.mean()}")
+        LOGGER.info(f"Std: {tsv_array.std()}")
+        LOGGER.info("===============================")
+        del tsv_array
 
         if filter_function is not None:
             LOGGER.info("Filtering dataset...")
             self.datalist = list(filter(filter_function, self.datalist))
+
+        self.datalist, self.max_volume, self.min_volume = normalize_volumes(volumes, self.datalist, max_volume, min_volume)
+
 
         data = self._generate_data_list()
 
@@ -138,9 +184,18 @@ class SyntheticLDM100K(Randomizable, CacheDataset):
             data.append(d)
         return data
 
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from src.logging_util import LOGGER
-import torch
+def get_bucket_counts(data: Dataset):    
+    bins = torch.tensor(np.arange(0, 1.01, 0.1), dtype=torch.float)
+    bins[0] = -0.001 
+
+    volumes = torch.tensor([x["volume"][0, 0] for x in data])
+
+
+    # inverse frequency, menaing we value each bin an equal amount
+    hist = torch.histogram(volumes, bins=bins)[0]
+
+    return hist
+
 
 def get_dataloader(data: Dataset, run_config: dict):
     if run_config["oversample_large_ventricles"]:
@@ -274,7 +329,7 @@ import json
 import pprint
 
 
-class RHFlairDataset(Randomizable, CacheDataset):
+class RHFlairDataset(Randomizable, CacheDataset, VolumeDataset):
 
     mask_file_path = "FLAIR_synthseg.nii.gz"
     image_file_path = "FLAIR.nii.gz"
@@ -287,13 +342,15 @@ class RHFlairDataset(Randomizable, CacheDataset):
         section,
         transform,
         seed=0,
-        size=7000,
+        size=10000,
         val_frac=0.2,
         test_frac=0.0,
         cache_num=sys.maxsize,
         cache_rate=1.0,
         num_workers=0,
-        sorted_by_volume=False
+        sorted_by_volume=False,
+        max_volume=None,
+        min_volume=None,
     ):
         if not path.isdir(dataset_path):
             raise ValueError("Root directory root_dir must be a directory.")
@@ -304,15 +361,19 @@ class RHFlairDataset(Randomizable, CacheDataset):
 
         self.datalist = []
 
-        #skipped_because_of_volumes = []
-        #skipped_because_2D = []
-        #skipped_because_no_info_about_acquisition_type = []
-        #too_many_volumes = []
+        skipped_because_of_volumes = []
+        skipped_because_2D = []
+        skipped_because_no_info_about_acquisition_type = []
+        too_many_volumes = []
         MRAcquisitionType = set()
 
         good_scan_paths = []
 
         volumes = []
+        
+        skipped_because_no_slice_thickness = []
+        skipped_because_slice_thickness_too_high = []
+
         import tqdm
 
         for rel_patient_path in tqdm.tqdm(os.listdir(dataset_path), desc="Collecting files and volumes..."):
@@ -328,13 +389,20 @@ class RHFlairDataset(Randomizable, CacheDataset):
                 with open(json_file) as f:
                     json_f = json.load(f)
                     if not "MRAcquisitionType" in json_f:
-                        #skipped_because_no_info_about_acquisition_type.append(scan_path)
+                        skipped_because_no_info_about_acquisition_type.append(scan_path)
                         continue
                     elif json_f["MRAcquisitionType"] == "2D":
-                        #skipped_because_2D.append(scan_path)
+                        skipped_because_2D.append(scan_path)
                         continue
-                    else:
-                        MRAcquisitionType.add(json_f["MRAcquisitionType"])
+
+                    if "SliceThickness" not in json_f:
+                        skipped_because_no_slice_thickness.append(scan_path)
+                        continue
+                    elif json_f["SliceThickness"] > 2.0:
+                        skipped_because_slice_thickness_too_high.append(scan_path)
+                        continue
+                    
+                    MRAcquisitionType.add(json_f["MRAcquisitionType"])
 
                 volume_df = pd.read_csv(volumes_file)
                 assert (volume_df["subject"] == "FLAIR").all()
@@ -348,7 +416,7 @@ class RHFlairDataset(Randomizable, CacheDataset):
                 assert volume_df.shape[0] == 1, "CSV should contain only one entry"
 
                 if volume_df.isna().values.any() or volume_df.values.astype(float).__le__(10).any():
-                    #skipped_because_of_volumes.append(scan_path)
+                    skipped_because_of_volumes.append(scan_path)
                     continue
 
 
@@ -360,9 +428,7 @@ class RHFlairDataset(Randomizable, CacheDataset):
 
                 self.datalist.append({
                     "image": image_file,
-                    "image_path": image_file,
                     "mask": mask_file,
-                    "mask_path": mask_file,
                     "volume": relative_volume
                 })
                 volumes.append(relative_volume)
@@ -370,8 +436,9 @@ class RHFlairDataset(Randomizable, CacheDataset):
                 if len(self.datalist) >= size: break
             if len(self.datalist) >= size: break
 
+        self.analyze_raw_volumes()
 
-        self.datalist = normalize_volumes(volumes, self.datalist)  
+        self.datalist, self.max_volume, self.min_volume = normalize_volumes(volumes, self.datalist, max_volume, min_volume)  
 
         #LOGGER.warning(f"skipped_because_2D={pprint.pformat(skipped_because_2D)}")
         #LOGGER.warning(f"skipped_because_of_volumes={pprint.pformat(skipped_because_of_volumes)}")
@@ -379,11 +446,17 @@ class RHFlairDataset(Randomizable, CacheDataset):
         #LOGGER.warning(f"too_many_volumes={pprint.pformat(too_many_volumes)}")
 
 
-        #LOGGER.warning(f"skipped_because_2D={len(skipped_because_2D)}")
-        #LOGGER.warning(f"skipped_because_of_volumes={len(skipped_because_of_volumes)}")
-        #LOGGER.warning(f"skipped_because_no_info_about_acquisition_type={len(skipped_because_no_info_about_acquisition_type)}")
-        #LOGGER.warning(f"too_many_volumes={len(too_many_volumes)}")
+        LOGGER.warning(f"skipped_because_2D={len(skipped_because_2D)}")
+        LOGGER.warning(f"skipped_because_of_volumes={len(skipped_because_of_volumes)}")
+        LOGGER.warning(f"skipped_because_no_info_about_acquisition_type={len(skipped_because_no_info_about_acquisition_type)}")
+        LOGGER.warning(f"too_many_volumes={len(too_many_volumes)}")
+        LOGGER.warning(f"skipped_because_no_slice_thickness={len(skipped_because_no_slice_thickness)}")
+        LOGGER.warning(f"skipped_because_slice_thickness_too_high={len(skipped_because_slice_thickness_too_high)}")
         LOGGER.info(f"Acquisition Types used: {MRAcquisitionType}")
+
+        print("Generate data list")
+        data = self._generate_data_list()
+        print("Generated data list")
 
         #from src.directory_management import OUTPUT_DIRECTORY
 
@@ -391,8 +464,6 @@ class RHFlairDataset(Randomizable, CacheDataset):
         #    for scan_path in good_scan_paths:
         #        f.write(scan_path)
         #        f.write("\n")
-
-        
 
         data = self._generate_data_list()
 
@@ -433,3 +504,186 @@ class RHFlairDataset(Randomizable, CacheDataset):
                 )
             data.append(d)
         return data
+
+
+dataset_map = {
+    "RH_FLAIR": (RHFlairDataset, 
+                 {
+                    "num_workers": 8,
+                    "dataset_path": DATA_DIRECTORY,
+
+                 }
+                ),
+    "LDM100K": (SyntheticLDM100K,
+                 {
+                    "num_workers": 6,
+                    "dataset_path": os.path.join(DATA_DIRECTORY, "LDM_100k"),
+                 }
+                ),
+}
+
+def load_dataset_from_config(run_config, section, transforms):
+      assert "dataset" in run_config, "Expected key 'dataset' in run_config"
+      assert "target_data" in run_config, "Expected key 'target_data' in run_config"
+      assert "dataset_size" in run_config, "Expected key 'dataset_size' in run_config"
+      assert "oversample_large_ventricles" in run_config, "Expected key 'oversample_large_ventricles' in run_config"
+
+      if isinstance(run_config["dataset"], str):
+        assert run_config["dataset"] in dataset_map, "Dataset name is not supported"
+        assert not isinstance(run_config["dataset_size"], Iterable), "If single dataset, need single dataset size"
+
+        dataset_constructor, kwargs = dataset_map[run_config["dataset"]]      
+            
+        return dataset_constructor(
+                section=section,
+                size=run_config["dataset_size"],
+                cache_rate=1.0,  # you may need a few Gb of RAM... Set to 0 otherwise
+                seed=0,
+                transform=transforms,
+                **kwargs,
+        )
+      elif isinstance(run_config["dataset"], Iterable):
+        assert isinstance(run_config["dataset_size"], Iterable), "If multiple datasets, need multiple dataset sizes"
+        assert len(run_config["dataset_size"]) == len(run_config["dataset"]), "Equal length expected"
+        assert isinstance(transforms, Iterable)
+        assert len(transforms) == len(run_config["dataset"])
+        for dataset_instance in run_config["dataset"]:
+            assert dataset_instance in dataset_map, "Dataset name is not supported"
+        from torch.utils.data import ConcatDataset
+        datasets = []
+        for i, dataset_instance in enumerate(run_config["dataset"]):
+            size = run_config["dataset_size"][i]
+
+            dataset_constructor, kwargs = dataset_map[run_config["dataset"]]      
+            
+            LOGGER.info(f"Loading dataset {run_config['dataset']}")
+
+            max_volume = None
+            min_volume = None
+            if i > 0:
+                max_volume = datasets[0].max_volume
+                min_volume = datasets[0].min_volume
+                LOGGER.info(f"Using from first dataset the normalizing max and min values: {max_volume:.3f}, {min_volume:.3f}")
+                
+
+            DS = dataset_constructor(
+                    section=section,
+                    size=size,
+                    cache_rate=1.0,  # you may need a few Gb of RAM... Set to 0 otherwise
+                    seed=0,
+                    transform=transforms[i],
+                    **kwargs,
+            )
+
+            datasets.append(DS)
+
+        return ConcatDataset(datasets)
+
+
+
+
+
+
+
+from collections.abc import Iterable
+
+
+def get_default_transforms(run_config, guidance):
+    def get_single_DS_transform(DS_str, run_config, guidance):
+        if DS_str == "RH_FLAIR":
+            return get_default_transforms_RH_FLAIR(target_spacing=run_config["target_spacing"], crop_size=run_config["input_image_crop_roi"], guidance=guidance)
+        elif DS_str == "LDM100K":
+            return get_default_transforms_LDM100k(target_spacing=run_config["target_spacing"] if "target_spacing" in run_config else run_config["input_image_downsampling_factors"],
+                                                crop_size=run_config["input_image_crop_roi"], guidance=guidance)
+        else:
+            raise Exception("Dataset not supported for defualt transforms")
+
+    if isinstance(run_config["dataset"], str): # singleton
+        return get_single_DS_transform(run_config["dataset"], run_config, guidance)
+    elif isinstance(run_config["dataset"], Iterable):
+        transforms_train = []
+        transforms_valid = []
+        for DS_str in enumerate(run_config["dataset"]):
+            train, val = get_single_DS_transform(DS_str, run_config, guidance)
+            transforms_train.append(train)
+            transforms_valid.append(val)
+
+        return transforms_train, transforms_valid
+    else:
+        raise Exception("Config input type not supported for defualt transforms")
+
+
+def get_default_transforms_RH_FLAIR(target_spacing, crop_size, guidance):
+    LOGGER.info("Using default transform from RH_FLAIR")
+    #from monai.data import MetaTensor
+    #from monai.data.utils import affine_to_spacing
+
+#    def update_spacing(d):
+#        img: MetaTensor = d["image"]
+#
+#        spacing = affine_to_spacing(img.affine)
+#
+#        #print(spacing, sep=' | ')
+#
+#        if (spacing > 2.0).any():
+#            LOGGER.info(f"Spacing unexpectedly too large: {spacing}")
+#
+#        return d
+
+        
+        
+
+    base_transforms = [
+            transforms.LoadImaged(keys=["image", "mask"]),
+            transforms.EnsureChannelFirstd(keys=["image", "mask"]),
+            transforms.EnsureTyped(keys=["image", "mask"]),
+            transforms.Lambdad(keys=["image"], func=lambda x: x[0, :, :, :].unsqueeze(0)), # select first channel if multiple channels occur
+
+            transforms.Orientationd(keys=["image"], axcodes="IPR"), # IAR # axcodes="RAS"
+            #transforms.Lambda(func=update_spacing),
+            transforms.Spacingd(keys=["mask"], pixdim=target_spacing, mode=("nearest")),
+            transforms.Spacingd(keys=["image"], pixdim=target_spacing, mode=("bilinear")),
+
+            transforms.Lambda(func=get_crop_around_mask_center(crop_size)),
+            transforms.ScaleIntensityRangePercentilesd(keys=["image"], lower=0.5, upper=99.5, b_min=0, b_max=1, clip=True),
+            transforms.Lambdad(keys=["volume"], 
+                            func = lambda x: (torch.tensor([x, 1.], dtype=torch.float32) if guidance else torch.tensor([x], dtype=torch.float32)).unsqueeze(0)),
+        ]
+
+    train_transforms = transforms.Compose([
+            *base_transforms,
+            # use random conditioning value if unconditioned case
+            transforms.RandLambdad(keys=["volume"], prob=0.2 if guidance else 0, func=lambda x: torch.tensor([random.random(), 0.]).unsqueeze(0)),
+            ])
+
+    valid_transforms = transforms.Compose(base_transforms)
+
+    return train_transforms, valid_transforms
+
+def get_default_transforms_LDM100k(run_config, target_spacing, crop_size, guidance):
+    base_transforms = [
+        transforms.LoadImaged(keys=["mask", "image"]),
+        transforms.EnsureChannelFirstd(keys=["mask", "image"]),
+        transforms.EnsureTyped(keys=["mask", "image"]),
+        transforms.Orientationd(keys=["mask", "image"], axcodes="IPL"), # axcodes="RAS"
+        transforms.Spacingd(keys=["mask"], pixdim=target_spacing, mode=("nearest")),
+        transforms.Spacingd(keys=["image"], pixdim=target_spacing, mode=("bilinear")),
+        transforms.CenterSpatialCropd(keys=["mask", "image"], roi_size=crop_size),
+        transforms.ScaleIntensityRangePercentilesd(keys=["image"], lower=0.5, upper=99.5, b_min=0, b_max=1, clip=True),
+
+        # Use extra conditioning variable to signify conditioned or non-conditioned case
+        transforms.Lambdad(keys=["volume"], 
+                           func = lambda x: (torch.tensor([x, 1.], dtype=torch.float32) if guidance 
+                                             else torch.tensor([x], dtype=torch.float32)).unsqueeze(0)),
+    ]
+
+
+    train_transforms = transforms.Compose([
+            *base_transforms,
+            # use random conditioning value if unconditioned case
+            transforms.RandLambdad(keys=["volume"], prob=0.2 if guidance else 0, func=lambda x: torch.tensor([random.random(), 0.]).unsqueeze(0)),
+            ])
+
+    valid_transforms = transforms.Compose(base_transforms)
+
+    return train_transforms, valid_transforms
