@@ -144,8 +144,11 @@ def visualize_reconstructions(train_loader, autoencoder, num_examples):
             if i+1 >= num_examples:
                 break
 
+import skimage
+from src.colors import default_mask_colors
+
 # setting path to None means no graph will be created and only images logged
-def visualize_3d_image_slice_wise(img: MetaTensor, path, description_prefix="", log_to_wandb=False, conditioning_information=None):
+def visualize_3d_image_slice_wise(img: MetaTensor, path, description_prefix="", log_to_wandb=False, conditioning_information=None, is_image_mask=False):
     axial = img[..., img.shape[2] // 2]
     coronal = img[:, img.shape[1] // 2, ...]
     sagittal = img[img.shape[0] // 2, ...]
@@ -153,14 +156,21 @@ def visualize_3d_image_slice_wise(img: MetaTensor, path, description_prefix="", 
     fig, axs = plt.subplots(nrows=1, ncols=3, figsize=(16, 4), constrained_layout=False)
 
     fig.suptitle(f"N. Ventricle Volume: {round(conditioning_information.item(), 3)}")
+
     for ax in axs:
         ax.axis("off")
-    ax = axs[0]
-    ax.imshow(axial, cmap="gray")
-    ax = axs[1]
-    ax.imshow(coronal, cmap="gray")
-    ax = axs[2]
-    ax.imshow(sagittal, cmap="gray")
+
+    if is_image_mask:
+        for i, m in enumerate([axial, coronal, sagittal]):
+            colored_mask = default_mask_colors[m.cpu().detach().numpy()]
+            axs[i].imshow(colored_mask)
+    else:
+        ax = axs[0]
+        ax.imshow(axial, cmap="gray")
+        ax = axs[1]
+        ax.imshow(coronal, cmap="gray")
+        ax = axs[2]
+        ax.imshow(sagittal, cmap="gray")
     if path:
         plt.savefig(path)
 
