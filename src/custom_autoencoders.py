@@ -1,4 +1,5 @@
 import torch
+from src.synthseg_masks import synthseg_classes
 from src.util import device
 from src.logging_util import LOGGER
 from generative.networks.nets import AutoencoderKL
@@ -79,3 +80,9 @@ class EmbeddingWrapper(IAutoencoder):
     
     def decode_stage_2_outputs(self, z: Tensor) -> Tensor:
         return self.autoencoder.decode_stage_2_outputs(z)
+
+
+def create_embedding_autoencoder(*args, **kwargs):
+    base_autoencoder = AutoencoderKL(*args, **kwargs)
+    autoencoder = EmbeddingWrapper(base_autoencoder=base_autoencoder, vocabulary_size=max(synthseg_classes) + 1, embedding_dim=64)
+    return autoencoder
