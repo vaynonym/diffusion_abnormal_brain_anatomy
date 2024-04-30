@@ -5,7 +5,7 @@ import pandas as pd
 import sys
 import csv
 import numpy as np
-from src.directory_management import DATA_DIRECTORY
+from src.directory_management import DATA_DIRECTORY, FLAIR_DATASET_DIRECTORY
 from monai import transforms
 from src.transforms import get_crop_around_mask_center
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
@@ -34,10 +34,14 @@ def normalize_volumes(volumes, datalist, max_volume = None, min_volume = None):
     if min_volume is None:
         min_volume = np.min(volumes)
 
+    LOGGER.info(f"Normalizing using max={max_volume:.3f}, min={min_volume:.3f}")
+
     def normalize_volume(d):
         d["volume"] = normalize(d["volume"], min_volume, max_volume)
         if d["volume"] > 1.000001:
-            LOGGER.warn(f"Normalized volume > 1.0 found: {d["volume"]}")
+            LOGGER.warn(f"Normalized volume > 1.0 found: {d['volume']}")
+        if d["volume"] < 0.0:
+            LOGGER.warn(f"Normalized volume < 0.0 found: {d['volume']}")
         return d
 
     return list(map(normalize_volume, datalist)), max_volume, min_volume
@@ -510,7 +514,7 @@ dataset_map = {
     "RH_FLAIR": (RHFlairDataset, 
                  {
                     "num_workers": 8,
-                    "dataset_path": DATA_DIRECTORY,
+                    "dataset_path": FLAIR_DATASET_DIRECTORY,
 
                  }
                 ),
@@ -524,7 +528,7 @@ dataset_map = {
 
 def load_dataset_from_config(run_config, section, transforms):
       assert "dataset" in run_config, "Expected key 'dataset' in run_config"
-      assert "target_data" in run_config, "Expected key 'target_data' in run_config"
+      #assert "target_data" in run_config, "Expected key 'target_data' in run_config"
       assert "dataset_size" in run_config, "Expected key 'dataset_size' in run_config"
       assert "oversample_large_ventricles" in run_config, "Expected key 'oversample_large_ventricles' in run_config"
 
@@ -554,24 +558,25 @@ def load_dataset_from_config(run_config, section, transforms):
         for i, dataset_instance in enumerate(run_config["dataset"]):
             size = run_config["dataset_size"][i]
 
-            dataset_constructor, kwargs = dataset_map[run_config["dataset"]]      
+            dataset_constructor, kwargs = dataset_map[dataset_instance]      
             
-            LOGGER.info(f"Loading dataset {run_config['dataset']}")
+            LOGGER.info(f"Loading dataset {dataset_instance}")
 
             max_volume = None
             min_volume = None
             if i > 0:
                 max_volume = datasets[0].max_volume
                 min_volume = datasets[0].min_volume
-                LOGGER.info(f"Using from first dataset the normalizing max and min values: {max_volume:.3f}, {min_volume:.3f}")
                 
 
             DS = dataset_constructor(
                     section=section,
                     size=size,
-                    cache_rate=1.0,  # you may need a few Gb of RAM... Set to 0 otherwise
+                    cache_rate=0.7,  # you may need a few Gb of RAM... Set to 0 otherwise
                     seed=0,
                     transform=transforms[i],
+                    max_volume=max_volume,
+                    min_volume=min_volume,
                     **kwargs,
             )
 
@@ -596,21 +601,21 @@ def get_default_transforms(run_config, guidance):
             return get_default_transforms_LDM100k(target_spacing=run_config["target_spacing"] if "target_spacing" in run_config else run_config["input_image_downsampling_factors"],
                                                 crop_size=run_config["input_image_crop_roi"], guidance=guidance)
         else:
-            raise Exception("Dataset not supported for defualt transforms")
+            raise Exception(f"Dataset {DS_str} not supported for deault transforms")
 
     if isinstance(run_config["dataset"], str): # singleton
         return get_single_DS_transform(run_config["dataset"], run_config, guidance)
     elif isinstance(run_config["dataset"], Iterable):
         transforms_train = []
         transforms_valid = []
-        for DS_str in enumerate(run_config["dataset"]):
+        for DS_str in run_config["dataset"]:
             train, val = get_single_DS_transform(DS_str, run_config, guidance)
             transforms_train.append(train)
             transforms_valid.append(val)
 
         return transforms_train, transforms_valid
     else:
-        raise Exception("Config input type not supported for defualt transforms")
+        raise Exception("Config input type not supported for default transforms")
 
 
 def get_default_transforms_RH_FLAIR(target_spacing, crop_size, guidance):
@@ -639,7 +644,7 @@ def get_default_transforms_RH_FLAIR(target_spacing, crop_size, guidance):
             transforms.EnsureTyped(keys=["image", "mask"]),
             transforms.Lambdad(keys=["image"], func=lambda x: x[0, :, :, :].unsqueeze(0)), # select first channel if multiple channels occur
 
-            transforms.Orientationd(keys=["image"], axcodes="IPR"), # IAR # axcodes="RAS"
+            transforms.Orientationd(keys=["image", "mask"], axcodes="IPR"), # IAR # axcodes="RAS"
             #transforms.Lambda(func=update_spacing),
             transforms.Spacingd(keys=["mask"], pixdim=target_spacing, mode=("nearest")),
             transforms.Spacingd(keys=["image"], pixdim=target_spacing, mode=("bilinear")),
@@ -660,12 +665,12 @@ def get_default_transforms_RH_FLAIR(target_spacing, crop_size, guidance):
 
     return train_transforms, valid_transforms
 
-def get_default_transforms_LDM100k(run_config, target_spacing, crop_size, guidance):
+def get_default_transforms_LDM100k(target_spacing, crop_size, guidance):
     base_transforms = [
         transforms.LoadImaged(keys=["mask", "image"]),
         transforms.EnsureChannelFirstd(keys=["mask", "image"]),
         transforms.EnsureTyped(keys=["mask", "image"]),
-        transforms.Orientationd(keys=["mask", "image"], axcodes="IPL"), # axcodes="RAS"
+        transforms.Orientationd(keys=["mask", "image"], axcodes="IPR"), # axcodes="RAS"
         transforms.Spacingd(keys=["mask"], pixdim=target_spacing, mode=("nearest")),
         transforms.Spacingd(keys=["image"], pixdim=target_spacing, mode=("bilinear")),
         transforms.CenterSpatialCropd(keys=["mask", "image"], roi_size=crop_size),
