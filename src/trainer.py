@@ -1,7 +1,7 @@
 import numpy as np
 from torch.optim.optimizer import Optimizer as Optimizer
 import wandb
-from typing import Tuple
+from typing import Tuple, Optional
 import os
 
 import torch
@@ -23,6 +23,7 @@ from src.synthseg_masks import encode_one_hot
 from src.evaluation import DiffusionModelEvaluator, MaskDiffusionModelEvaluator, AutoencoderEvaluator, MaskAutoencoderEvaluator, MaskEmbeddingAutoencoderEvaluator, SpadeAutoencoderEvaluator, SpadeDiffusionModelEvaluator
 from src.directory_management import MODEL_DIRECTORY
 from src.custom_autoencoders import IAutoencoder
+from src.diffusion import ILatentDiffusionInferer
 
 from torch.nn import CrossEntropyLoss
 
@@ -43,7 +44,7 @@ class AutoencoderTrainer():
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.wandb_prefix = "autoencoder/training"
-        self.evaluator = AutoencoderEvaluator(self.autoencoder, self.val_loader, self.wandb_prefix)
+        self.evaluator = None #AutoencoderEvaluator(self.autoencoder, self.val_loader, self.wandb_prefix)
 
         self.lr=auto_encoder_training_config["learning_rate"]
 
@@ -117,17 +118,18 @@ class AutoencoderTrainer():
 
             self.log_epoch(step, epoch, epoch_loss, gen_epoch_loss, disc_epoch_loss)
 
-            if epoch + 1 in (np.round(np.arange(0.0, 1.01, self.evaluation_intervall) * self.n_epochs)):
+            with Stopwatch("Saving new state took: "):
+                previously_saved_epoch = self.current_epoch
+                self.current_epoch = epoch + 1
+                self.save_state()
+                self.delete_save(previously_saved_epoch)
                 self.evaluator.visualize_batch(batch=batch)
+
+
+            if epoch + 1 in (np.round(np.arange(0.0, 1.01, self.evaluation_intervall) * self.n_epochs)):
                 
                 with Stopwatch("Validation took: "):
                     self.evaluator.evaluate()
-
-                with Stopwatch("Saving new state took: "):
-                    previously_saved_epoch = self.current_epoch
-                    self.current_epoch = epoch + 1
-                    self.save_state()
-                    self.delete_save(previously_saved_epoch)
 
         # clean up data
         self.clean_up()
@@ -171,14 +173,15 @@ class AutoencoderTrainer():
         
     def do_step(self, batch, epoch):
         (step_loss, gen_step_loss, disc_step_loss) = (0, 0, 0)
-        
-        model_input = self.get_input_from_batch(batch)
-        ground_truth = self.get_input_for_evaluation_from_batch(model_input, batch)
+        with torch.no_grad():
+            model_input = self.get_input_from_batch(batch)
 
         # Generator part
         self.optimizer_g.zero_grad(set_to_none=True)
         reconstruction, z_mu, z_sigma = self.autoencoder(*model_input)
         
+        with torch.no_grad():
+            ground_truth = self.get_input_for_evaluation_from_batch(model_input, batch)
 
         recons_loss = self.reconstruction_loss(reconstruction, ground_truth)
         loss_g = recons_loss
@@ -314,13 +317,14 @@ class DiffusionModelTrainer():
                  autoencoder: IAutoencoder,
                  unet: DiffusionModelUNet,
                  optimizer_diff: torch.optim.Optimizer, scaler: GradScaler,
-                 inferer: LatentDiffusionInferer,
+                 inferer: ILatentDiffusionInferer,
                  train_loader: DataLoader, valid_loader: DataLoader,
                  encoding_shape: torch.Size,
                  diffusion_model_training_config: dict, 
                  evaluation_intervall: float,
                  evaluation_scheduler: Scheduler,
                  starting_epoch=0,
+                 guidance: Optional[float] = None,
                 ) -> None:
         self.wandb_prefix = "diffusion/training"
         wandb.define_metric(f"{self.wandb_prefix}/epoch")
@@ -331,6 +335,7 @@ class DiffusionModelTrainer():
         self.encoding_shape = encoding_shape
         self.evaluation_intervall= evaluation_intervall
         self.inferer = inferer
+        self.guidance = guidance
 
         # stateful
         self.optimizer = optimizer_diff
@@ -352,11 +357,12 @@ class DiffusionModelTrainer():
         self.evaluator = DiffusionModelEvaluator(self.diffusion_model, self.evaluation_scheduler, 
                                                  self.autoencoder, self.encoding_shape, self.inferer,
                                                  self.val_loader, self.train_loader,
-                                                 wandb_prefix=self.wandb_prefix
+                                                 wandb_prefix=self.wandb_prefix,
+                                                 guidance=self.guidance
                                                  )
     
     def loss_function(self, x: Tensor, y: Tensor) -> Tensor:
-        return F.mse_loss(x.float(), y.float())
+        return F.mse_loss(x.float(), y.float()) #, reduction="none")
 
     
     def get_input_from_batch(self, batch: dict) -> dict:
@@ -381,11 +387,10 @@ class DiffusionModelTrainer():
             
             self.log_epoch(step, epoch, epoch_loss)
 
+            with Stopwatch("Sampling example images took: "):
+                self.evaluator.log_samples(1, False)
 
             if epoch + 1 in (np.round(np.arange(0.0, 1.01, self.evaluation_intervall) * self.n_epochs)):
-                with Stopwatch("Sampling example images took: "):
-                    self.evaluator.log_samples(1, False)
-                
                 with Stopwatch("Evaluation metrics took: "):
                     self.evaluator.evaluate()
 
@@ -435,6 +440,9 @@ class DiffusionModelTrainer():
 
         
     def save_state(self):
+        #from torch._dynamo import OptimizedModule
+        #autoencoder = self.autoencoder if not isinstance(self.autoencoder, OptimizedModule) else self.autoencoder._orig_mod
+        #diffusion_model = self.diffusion_model if not isinstance(self.diffusion_model, OptimizedModule) else self.diffusion_model._orig_mod
 
         state = {f"model_{self.autoencoder.__class__.__name__}": self.autoencoder.state_dict(),
                  f"model_{self.diffusion_model.__class__.__name__}": self.diffusion_model.state_dict(),
@@ -490,6 +498,7 @@ class MaskDiffusionModelTrainer(DiffusionModelTrainer):
                             val_loader=self.val_loader,
                             train_loader=self.train_loader,
                             wandb_prefix=self.wandb_prefix,
+                            guidance=self.guidance
         )
 
     def get_input_from_batch(self, batch: dict) -> dict:
@@ -509,6 +518,7 @@ class MaskEmbeddingDiffusionModelTrainer(DiffusionModelTrainer):
                             val_loader=self.val_loader,
                             train_loader=self.train_loader,
                             wandb_prefix=self.wandb_prefix,
+                            guidance=self.guidance,
         )
 
     def get_input_from_batch(self, batch: dict) -> dict:
@@ -529,6 +539,7 @@ class SpadeDiffusionModelTrainer(DiffusionModelTrainer):
                             val_loader=self.val_loader,
                             train_loader=self.train_loader,
                             wandb_prefix=self.wandb_prefix,
+                            guidance=self.guidance,
                             )
     
     def get_input_from_batch(self, batch: dict) -> dict:
