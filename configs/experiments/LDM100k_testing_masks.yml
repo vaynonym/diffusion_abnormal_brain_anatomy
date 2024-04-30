@@ -1,11 +1,12 @@
 run:
   batch_size: 2
-  input_image_downsampling_factors: [2, 2, 2] # (160, 224, 160) ==>
-  input_image_crop_roi: [80,112,80]
-  evaluation_intervall: 0.05
+  input_image_downsampling_factors: [1.667, 1.75, 1.667] # [2, 2, 2]  # (160, 224, 160) ==>
+  input_image_crop_roi: [96,128,96] # [80,112,80]  
+  evaluation_intervall: 0.5
   dataset: "LDM100K"
   target_data: "mask"
-  dataset_size: 2500
+  dataset_size: 9999
+  oversample_large_ventricles: False
 
 auto_encoder: 
   spatial_dims: 3
@@ -23,28 +24,33 @@ autoencoder_training:
   n_epochs: 40
   learning_rate: 0.000025
   autoencoder_warm_up_n_epochs: 3
+  adverserial_loss: False
+  adv_weight: 0.01
 
 patch_discrim: 
   spatial_dims: 3
   num_layers_d: 3
-  num_channels: 64
+  num_channels: 32
   in_channels: 33
-  out_channels: 33
+  out_channels: 1
 
 diffusion_model_unet: 
   spatial_dims: 3
   in_channels: 3
   out_channels: 3
   num_res_blocks: 2
-  num_channels: [128, 256, 512]
+  num_channels: [256, 512, 768]
   attention_levels: [False, True, True]
-  num_head_channels: [0, 256, 512]
+  num_head_channels: [0, 512, 768]
   norm_num_groups: 32
   upcast_attention: True
   resblock_updown: True
   with_conditioning: True
-  cross_attention_dim: 1
+  cross_attention_dim: 2
 
 diffusion_model_unet_training:
-  n_epochs: 10
-  learning_rate: 0.00002
+#  scale_loss_of_large_volume_up: True
+  classifier_free_guidance: True
+  batch_size: 8
+  n_epochs: 5
+  learning_rate: 0.000005

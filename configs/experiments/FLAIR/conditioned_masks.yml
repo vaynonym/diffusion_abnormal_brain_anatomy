@@ -2,7 +2,7 @@ run:
   batch_size: 2
   target_spacing: [1.667, 1.75, 1.667] # [2, 2, 2]  # (160, 224, 160) ==>
   input_image_crop_roi: [96,112,96] # [80,112,80]  
-  evaluation_intervall: 0.2
+  evaluation_intervall: 0.33
   dataset: "RH_FLAIR"
   target_data: "mask"
   dataset_size: 10000
@@ -52,5 +52,5 @@ diffusion_model_unet_training:
 #  scale_loss_of_large_volume_up: True
   classifier_free_guidance: 4.0
   batch_size: 8
-  n_epochs: 20
+  n_epochs: 10
   learning_rate: 0.000005

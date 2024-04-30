@@ -5,7 +5,7 @@ run:
   evaluation_intervall: 0.05
   dataset: "LDM100K"
   target_data: "mask"
-  dataset_size: 5000
+  dataset_size: 3000
 
 auto_encoder: 
   spatial_dims: 3
@@ -48,5 +48,8 @@ diffusion_model_unet:
   cross_attention_dim: 1
 
 diffusion_model_unet_training:
+#  scale_loss_of_large_volume_up: True
+  classifier_free_guidance: 4.0
+  batch_size: 8
   n_epochs: 20
   learning_rate: 0.00002

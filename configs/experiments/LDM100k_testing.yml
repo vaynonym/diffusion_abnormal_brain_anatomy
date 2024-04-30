@@ -1,10 +1,10 @@
 run:
   batch_size: 2
-  input_image_downsampling_factors: [1.67, 1.75, 1.67] # (160, 224, 160) ==>
-  input_image_crop_roi: [96,128,96] # [80, 112, 80]
-  evaluation_intervall: 0.1
+  input_image_downsampling_factors: [2, 2, 2] # (160, 224, 160) ==>
+  input_image_crop_roi: [80, 112, 80] # [96,128,96] #
+  evaluation_intervall: 0.002
   dataset: "LDM100K"
-  dataset_size: 9999 # 6000
+  dataset_size: 4000
 
 auto_encoder: 
   spatial_dims: 3
@@ -15,12 +15,12 @@ auto_encoder:
   num_res_blocks: 2
   norm_num_groups: 32
   attention_levels: [False, False, False]
-  with_encoder_nonlocal_attn: False
-  with_decoder_nonlocal_attn: False
+  #with_encoder_nonlocal_attn: False
+  #with_decoder_nonlocal_attn: False
 
 autoencoder_training: 
-  n_epochs: 40
-  learning_rate: 0.000025
+  n_epochs: 30
+  #learning_rate: 0.000025
   autoencoder_warm_up_n_epochs: 3
 
 patch_discrim: 
@@ -45,5 +45,5 @@ diffusion_model_unet:
   cross_attention_dim: 1
 
 diffusion_model_unet_training:
-  n_epochs: 30
+  n_epochs: 16
   learning_rate: 0.00002

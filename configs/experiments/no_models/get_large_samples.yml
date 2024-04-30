@@ -1,0 +1,8 @@
+run:
+  batch_size: 2
+  target_spacing: [1.667, 1.75, 1.667] # [2, 2, 2]  # (160, 224, 160) ==>
+  input_image_crop_roi: [96,128,96] # [80,112,80]  
+  dataset: "RH_FLAIR"
+  target_data: "mask"
+  dataset_size: 10000
+  oversample_large_ventricles: False

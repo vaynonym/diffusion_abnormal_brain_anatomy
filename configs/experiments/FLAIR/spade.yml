@@ -1,10 +1,10 @@
 run:
   batch_size: 1
   target_spacing: [1.667, 1.75, 1.667] # [2, 2, 2]  # (160, 224, 160) ==>
-  input_image_crop_roi: [96,112,96] # [80,112,80]  
-  evaluation_intervall: 0.2
-  dataset: "RH_FLAIR"
-  dataset_size: 9999
+  input_image_crop_roi: [96,128,96] # [80,112,80]  
+  evaluation_intervall: 0.33
+  dataset: ["RH_FLAIR", "LDM100K"]
+  dataset_size: [10000, 5000]
   oversample_large_ventricles: False
 
 auto_encoder: 
@@ -21,17 +21,18 @@ auto_encoder:
   with_decoder_nonlocal_attn: False
 
 autoencoder_training: 
-  n_epochs: 30
+  n_epochs: 10
   learning_rate: 0.000025
-  autoencoder_warm_up_n_epochs: 3
+  autoencoder_warm_up_n_epochs: 1
   adverserial_loss: True
-  adv_weight: 0.01
+  adv_weight: 0.005
+  pretrained: ["uj6bvcmy","vaynonym", "thesis_testruns"]
 
 
 patch_discrim: 
   spatial_dims: 3
   num_layers_d: 3
-  num_channels: 32
+  num_channels: 64
   in_channels: 1
   out_channels: 1
 
@@ -47,12 +48,13 @@ diffusion_model_unet:
   upcast_attention: True
   resblock_updown: True
   with_conditioning: False
-  cross_attention_dim: null
+  cross_attention_dim: 1
   label_nc: 33
 
 
 diffusion_model_unet_training:
   classifier_free_guidance: null
   batch_size: 6
-  n_epochs: 20
+  n_epochs: 5
   learning_rate: 0.00002
+  pretrained: ["2cuvdhsn","vaynonym", "thesis_testruns"]

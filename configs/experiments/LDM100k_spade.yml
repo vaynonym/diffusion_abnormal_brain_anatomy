@@ -1,10 +1,11 @@
 run:
-  batch_size: 2
-  input_image_downsampling_factors: [2, 2, 2] # (160, 224, 160) ==>
-  input_image_crop_roi: [80, 112, 80]
-  evaluation_intervall: 0.05
+  batch_size: 1
+  input_image_downsampling_factors: [1.667, 1.75, 1.667] # [2.0, 2.0, 2.0] # # (160, 224, 160) ==>
+  input_image_crop_roi: [96,128,96] # [80, 112, 80]
+  evaluation_intervall: 0.34
   dataset: "LDM100K"
-  dataset_size: 6000 # 6000
+  dataset_size: 9999
+  oversample_large_ventricles: False
 
 auto_encoder: 
   spatial_dims: 3
@@ -20,14 +21,17 @@ auto_encoder:
   with_decoder_nonlocal_attn: False
 
 autoencoder_training: 
-  n_epochs: 20
+  n_epochs: 30
   learning_rate: 0.000025
   autoencoder_warm_up_n_epochs: 3
+  adverserial_loss: True
+  adv_weight: 0.01
+
 
 patch_discrim: 
   spatial_dims: 3
   num_layers_d: 3
-  num_channels: 64
+  num_channels: 32
   in_channels: 1
   out_channels: 1
 
@@ -48,5 +52,7 @@ diffusion_model_unet:
 
 
 diffusion_model_unet_training:
-  n_epochs: 30
+  classifier_free_guidance: null
+  batch_size: 6
+  n_epochs: 20
   learning_rate: 0.00002
