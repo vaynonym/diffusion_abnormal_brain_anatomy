@@ -22,7 +22,8 @@ from src.util import load_wand_credentials, Stopwatch, read_config, read_config_
 from src.model_util import load_model_from_run_with_matching_config, load_model_from_run, check_dimensions
 from src.logging_util import LOGGER
 from src.directory_management import DATA_DIRECTORY, OUTPUT_DIRECTORY
-from src.datasets import SyntheticLDM100K, get_dataloader
+from src.datasets import get_dataloader, get_default_transforms, load_dataset_from_config
+
 
 from src.diffusion import get_scale_factor
 from src.custom_autoencoders import EmbeddingWrapper
@@ -100,38 +101,12 @@ diffusion_model = load_model_from_run(run_id=WANDB_DIFFUSIONMODEL_RUNID, project
 
 LOGGER.info("Loading dataset...")
 
+_, valid_transforms = get_default_transforms(run_config, CLASSIFIER_FREE_GUIDANCE)
+validation_ds = load_dataset_from_config(run_config, "validation", valid_transforms)
 
-val_transforms = transforms.Compose(
-    [
-        transforms.LoadImaged(keys=["mask", "image"]),
-        transforms.EnsureChannelFirstd(keys=["mask", "image"]),
-        transforms.EnsureTyped(keys=["mask", "image"]),
-        transforms.Orientationd(keys=["mask", "image"], axcodes="IPL"), # axcodes="RAS"
-        transforms.Spacingd(keys=["mask"], pixdim=run_config["input_image_downsampling_factors"], mode=("nearest")),
-        transforms.Spacingd(keys=["image"], pixdim=run_config["input_image_downsampling_factors"], mode=("bilinear")),
-        transforms.CenterSpatialCropd(keys=["mask", "image"], roi_size=run_config["input_image_crop_roi"]),
-        transforms.ScaleIntensityRangePercentilesd(keys=["image"], lower=0.5, upper=99.5, b_min=0, b_max=1, clip=True),
-        transforms.Lambdad(keys=["volume"], func = lambda x: torch.tensor(x, dtype=torch.float32).unsqueeze(0).unsqueeze(0)),
-                # Use extra conditioning variable to signify conditioned or non-conditioned case
-        transforms.Lambdad(keys=["volume"], 
-                           func = lambda x: (torch.tensor([x, 1.], dtype=torch.float32) 
-                                             if CLASSIFIER_FREE_GUIDANCE 
-                                             else torch.tensor([x], dtype=torch.float32)).unsqueeze(0)),
-    ]
-)
+from src.dataset_analysis import log_bucket_counts
 
-dataset_size = run_config["dataset_size"]
-
-validation_ds = SyntheticLDM100K(
-    dataset_path=os.path.join(DATA_DIRECTORY, "LDM_100k"),
-    section="validation",  # validation
-    size=dataset_size,
-    cache_rate=1.0,  # you may need a few Gb of RAM... Set to 0 otherwise
-    num_workers=6,
-    seed=0,
-    transform=val_transforms,
-    sorted_by_volume=True
-)
+log_bucket_counts(validation_ds)
 
 valid_loader = get_dataloader(validation_ds, run_config)
 
@@ -199,7 +174,7 @@ for fig, (name, mean_voxel_counts, min_max_voxel_counts) in zip(figures, results
     plt.errorbar(x=np.arange(0, 1.0, bucket_size) + bucket_size/2,
             #width=bucket_size,
             y=list(mean_voxel_counts.values())[1:],
-            yerr=min_max_error[:, 1:],
+            #yerr=min_max_error[:, 1:],
             color="blue",
             label="Ground Truth",
             marker="o", capsize=5, capthick=1, ecolor="blue", lw=1
@@ -236,14 +211,14 @@ encoding_shape = (run_config["batch_size"], auto_encoder_config["latent_channels
 LOGGER.info(f"Encoding shape: {encoding_shape}")
 LOGGER.info("Generating synthetic examples...")
 
-fake_volume_dataloader = create_fake_volume_dataloader(min_val=1.05, max_val=1.6, bucket_size=0.1, number_sumples_per_bucket=50,
+fake_volume_dataloader = create_fake_volume_dataloader(min_val=1.05, max_val=1.6, bucket_size=0.1, number_samples_per_bucket=50,
                                                        classifier_free_guidance=CLASSIFIER_FREE_GUIDANCE,
                                                        batch_size=run_config["batch_size"]
                                                        )
 
+LOGGER.info(f"Fake volume dataloader length: {len(fake_volume_dataloader)}")
 
-
-guidance_values = [1.0, 1.5, 2.0, 3.0, 4.0, 5.0]
+guidance_values = [1.0, 2.0, 3.0, 4.0, 5.0]
 
 
 legend_labels = ["Ground Truth"] + [f"Synthetic G={G:.1f}" for G in guidance_values]
@@ -287,7 +262,7 @@ for G in guidance_values:
                 append_voxel_count(mask, buckets_of_batch, indices, voxel_counts)
 
     for batch in tqdm(fake_volume_dataloader, desc="Generating for abnormal values"):
-
+        conditioning_value = batch["volume"].to(device)
         mask = decode_one_hot(evaluator.get_synthetic_output(batch, True)).int()
 
 
@@ -331,15 +306,17 @@ for G, results, color in zip(guidance_values, guidance_all_results, colors):
         plt.errorbar(x=np.arange(0, 1.6, bucket_size) + bucket_size/2,
                 #width=bucket_size,
                 y=list(mean_voxel_counts.values())[1:],
-                yerr=min_max_error[:, 1:],
+                #yerr=min_max_error[:, 1:],
                 color=color,
                 label=f"Synthetic G={G:.1f}",
-                marker="o", capsize=5, capthick=1, ecolor="red", lw=1
+                marker="o", capsize=5, capthick=1, ecolor="red", lw=1, alpha=0.8
                 )
 
-        LOGGER.info(f"{name}: {np.array(list(mean_voxel_counts.values()))}")
+        LOGGER.info(f"{name}: \n{repr(np.array(list(mean_voxel_counts.values())))}")
 
 for fig, (name, _, _ ) in zip(figures, classes):
     plt.figure(fig)
+    plt.xlabel("Normalized Volume Ratio", fontsize=16)
+    plt.ylabel("Voxel Count", fontsize=16)
     plt.figlegend()
     plt.savefig(f"{OUTPUT_DIRECTORY}/{name}_volume.png")
