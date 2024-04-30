@@ -18,7 +18,6 @@ import numpy as np
 
 from src.util import load_wand_credentials, Stopwatch, read_config, log_image_with_mask
 from src.model_util import save_model_as_artifact, load_model_from_run_with_matching_config, check_dimensions
-from src.training import train_diffusion_model
 from src.logging_util import LOGGER
 from src.datasets import RHFlairDataset
 from src.diffusion import get_scale_factor
@@ -214,8 +213,8 @@ base_autoencoder = AutoencoderKL(**auto_encoder_config).to(device)
 autoencoder = EmbeddingWrapper(base_autoencoder=base_autoencoder, vocabulary_size=max(synthseg_classes) + 1, embedding_dim=64)
 
 # Try to load identically trained autoencoder if it already exists. Else train a new one.
-if not load_model_from_run_with_matching_config([run_config, auto_encoder_config, auto_encoder_training_config, patch_discrim_config],
-                                            ["run_config", "auto_encoder_config", "auto_encoder_training_config", "patch_discrim_config"],
+if not load_model_from_run_with_matching_config([auto_encoder_config, auto_encoder_training_config, patch_discrim_config],
+                                            ["auto_encoder_config", "auto_encoder_training_config", "patch_discrim_config"],
                                             project=project, entity=entity,
                                             model=autoencoder, artifact_name=autoencoder.__class__.__name__,
                                             ):
