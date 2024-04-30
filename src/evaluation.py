@@ -318,6 +318,9 @@ class DiffusionModelEvaluator():
     
     @torch.no_grad()
     def get_synthetic_output(self, batch, use_evaluation_scheduler):
+        self.autoencoder.eval()
+        self.diffusion_model.eval()
+
         latent_noise = torch.randn(self.latent_shape).to(device)    
         additional_inputs = self.get_additional_input_from_batch(batch)
 
