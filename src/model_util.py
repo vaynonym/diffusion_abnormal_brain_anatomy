@@ -108,7 +108,7 @@ def load_model_from_run(run_id, project, entity, model_class, create_model_from_
         create_model_from_config = model_class
 
     artifact_name = model_class.__name__
-    
+    LOGGER.info(f"Attempting to load model from {entity}/{project}/{run_id}")
     run = wandb.Api().run(f"{entity}/{project}/{run_id}")
 
     
@@ -139,6 +139,7 @@ def load_model_from_run(run_id, project, entity, model_class, create_model_from_
 
     # have wandb show connection between runs
     if wandb.run is not None:
-        wandb.use_artifact(fitting_artifact.name)
+        if wandb.run.project_name() == project:
+            wandb.use_artifact(fitting_artifact.name)
 
     return model
