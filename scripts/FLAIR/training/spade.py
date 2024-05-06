@@ -134,7 +134,7 @@ if "pretrained" in auto_encoder_training_config and auto_encoder_training_config
                                 patch_discrim_config=patch_discrim_config, auto_encoder_training_config=auto_encoder_training_config,
                                 WANDB_LOG_IMAGES=WANDB_LOG_IMAGES,
                                 evaluation_intervall=run_config["evaluation_intervall"],
-                                starting_epoch=5
+                                starting_epoch=0
                                 )
     
     with Stopwatch("Training took: "):
@@ -156,7 +156,7 @@ else:
                                     patch_discrim_config=patch_discrim_config, auto_encoder_training_config=auto_encoder_training_config,
                                     WANDB_LOG_IMAGES=WANDB_LOG_IMAGES,
                                     evaluation_intervall=run_config["evaluation_intervall"],
-                                    starting_epoch=5
+                                    starting_epoch=0
                                     )
         
         with Stopwatch("Training took: "):

@@ -104,6 +104,7 @@ from src.synthseg_masks import encode_one_hot, decode_one_hot_to_consecutive_ind
 from tqdm import tqdm
 
 from monai.data.meta_tensor import MetaTensor
+from pprint import pprint
 
 for case_identifier, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
     image : MetaTensor = batch["image"][0]
@@ -118,6 +119,10 @@ for case_identifier, batch in tqdm(enumerate(train_loader), total=len(train_load
         raw_mask[:, :, :, :] = mask
 
     sub_path = f"{case_identifier}"
+
+    pprint(image.meta)
+    if case_identifier < 3: continue
+    else: break
 
 
     # manually overwrite affine mismatch, which is very small but causes warnings in NNUNet
