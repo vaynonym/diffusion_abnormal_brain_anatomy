@@ -157,6 +157,7 @@ class AutoencoderTrainer():
     
     def load_state(self):
         path = os.path.join(MODEL_DIRECTORY, f"{self.__class__.__name__}_E{self.current_epoch}.pth")
+        LOGGER.info(f"Loading state from {path}")
         assert os.path.exists(path), f"Since starting epoch is not zero, expects state to exist at: {path}"
 
         state = torch.load(path, map_location=device)
