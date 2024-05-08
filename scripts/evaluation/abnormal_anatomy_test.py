@@ -97,6 +97,7 @@ unet = load_model_from_run(run_id=WANDB_DIFFUSIONMODEL_RUNID, project=project, e
 
 
 scheduler = DDPMScheduler(num_train_timesteps=1000, schedule="scaled_linear_beta", beta_start=0.0015, beta_end=0.0205, clip_sample=False)
+scheduler.set_timesteps(1000)
 evaluation_scheduler = DDIMScheduler(num_train_timesteps=1000, schedule="scaled_linear_beta", beta_start=0.0015, beta_end=0.0205, clip_sample=False)
 evaluation_scheduler.set_timesteps(50)
 
@@ -110,7 +111,7 @@ LOGGER.info(f"Scaling factor set to {scale_factor}")
 
 inferer = LatentDiffusionInferer(scheduler, scale_factor=scale_factor)
 
-dataset = torch.arange(0.75, 2.0, 0.1).unsqueeze(0).repeat(2, 1).flatten().unsqueeze(1).unsqueeze(2)
+dataset = torch.arange(0.85, 1.5, 0.1).unsqueeze(0).repeat(3, 1).flatten().unsqueeze(1).unsqueeze(2)
 
 from torch.utils.data import TensorDataset
 
@@ -135,10 +136,11 @@ fake_volume_dataloader = DataLoader(fake_volume_dataset,
                                     shuffle=False, num_workers=2,
                                     drop_last=True,
                                     persistent_workers=True,
-                                    collate_fn=collate_guidance if diffusion_model_training_config["classifier_free_guidance"] else collate
+                                    collate_fn=collate_guidance if CLASSIFIER_FREE_GUIDANCE else collate
                                     )
 
 autoencoder.eval()
+unet.eval()
 
 MaskDiffusionModelEvaluator(
                  diffusion_model=unet,
@@ -149,6 +151,7 @@ MaskDiffusionModelEvaluator(
                  train_loader=fake_volume_dataloader,
                  wandb_prefix="abnormal_mask/DDIM",
                  evaluation_scheduler=evaluation_scheduler,
+                 guidance=CLASSIFIER_FREE_GUIDANCE
                  ).log_samples(500, True)
 
 MaskDiffusionModelEvaluator(
@@ -160,6 +163,7 @@ MaskDiffusionModelEvaluator(
                  train_loader=fake_volume_dataloader,
                  wandb_prefix="abnormal_mask/DDPM",
                  evaluation_scheduler=evaluation_scheduler,
+                 guidance=CLASSIFIER_FREE_GUIDANCE
                  ).log_samples(500, False)
 
 
