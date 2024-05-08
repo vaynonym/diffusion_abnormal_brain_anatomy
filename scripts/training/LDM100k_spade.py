@@ -18,9 +18,9 @@ from generative.networks.schedulers import DDPMScheduler, DDIMScheduler
 
 
 from src.util import load_wand_credentials, Stopwatch, read_config, log_image_with_mask
-from src.model_util import save_model_as_artifact, load_model_from_run_with_matching_config, check_dimensions
+from src.model_util import save_model_as_artifact, load_model_from_run_with_matching_config, load_model_from_run, check_dimensions
 from src.logging_util import LOGGER
-from src.datasets import SyntheticLDM100K
+from src.datasets import SyntheticLDM100K, get_dataloader
 from src.diffusion import get_scale_factor
 from src.directory_management import DATA_DIRECTORY
 from src.trainer import SpadeAutoencoderTrainer, SpadeDiffusionModelTrainer
@@ -75,10 +75,12 @@ def peek(x):
     LOGGER.info(x)
     return x
 
+import numpy as np
 
 train_transforms = transforms.Compose(
     [
-        transforms.LoadImaged(keys=["mask", "image"]),
+        transforms.LoadImaged(keys=["mask"], dtype=np.int8),
+        transforms.LoadImaged(keys=["image"], dtype=np.float32),
         transforms.EnsureChannelFirstd(keys=["mask", "image"]),
         transforms.EnsureTyped(keys=["mask", "image"]),
         transforms.Orientationd(keys=["mask", "image"], axcodes="IPL"), # axcodes="RAS"
@@ -117,8 +119,9 @@ validation_ds = SyntheticLDM100K(
 )
 
 
-train_loader = DataLoader(train_ds, batch_size=run_config["batch_size"], shuffle=True, num_workers=2, persistent_workers=True, drop_last=True)
-valid_loader = DataLoader(validation_ds, batch_size=run_config["batch_size"], shuffle=True, drop_last=True)
+train_loader = get_dataloader(train_ds, run_config)
+valid_loader = get_dataloader(validation_ds, run_config)
+
 
 dataset_preparation_stopwatch.stop().display()
 
@@ -132,22 +135,30 @@ encoding_shape = (run_config["batch_size"], auto_encoder_config["latent_channels
 LOGGER.info(f"Encoding shape: {encoding_shape}")
 
 # ### Visualise examples from the training set
-iterator = enumerate(train_loader)
-sample_data = None # reused later
 for i in range(1):
-    _, sample_data = next(iterator)
+    iterator = iter(train_loader)
+    sample_data = next(iterator)
     sample_index = 0
     mask = sample_data["mask"][sample_index, 0].detach().cpu().numpy()
     image = sample_data["image"][sample_index, 0].detach().cpu().numpy()
-    log_image_with_mask(image, mask, None, None, "trainingdata", sample_data["volume"][sample_index])
+
+    log_image_with_mask(image, mask, None, None, "trainingdata", sample_data["volume"][sample_index, 0])
 
 
-LOGGER.info(f"Batch image shape: {sample_data['mask'].shape}")
+    LOGGER.info(f"Batch image shape: {sample_data['mask'].shape}")
+
+
+WANDB_AUTOENCODER_RUNID = os.environ.get("WANDB_AUTOENCODER_RUNID")
 
 autoencoder = SPADEAutoencoderKL(**auto_encoder_config).to(device)
 
-if not load_model_from_run_with_matching_config([auto_encoder_config, auto_encoder_training_config, patch_discrim_config],
-                                            ["auto_encoder_config", "auto_encoder_training_config", "patch_discrim_config"],
+
+if WANDB_AUTOENCODER_RUNID is not None and WANDB_AUTOENCODER_RUNID != "":
+    autoencoder = load_model_from_run(WANDB_AUTOENCODER_RUNID, project=project, entity=entity, model_class=autoencoder.__class__,
+                        create_model_from_config=None
+                        ).to(device)
+elif not load_model_from_run_with_matching_config([run_config, auto_encoder_config, auto_encoder_training_config, patch_discrim_config],
+                                            ["run_config", "auto_encoder_config", "auto_encoder_training_config", "patch_discrim_config"],
                                             project=project, entity=entity,
                                             model=autoencoder, artifact_name=autoencoder.__class__.__name__,
                                             ):
@@ -157,7 +168,7 @@ if not load_model_from_run_with_matching_config([auto_encoder_config, auto_encod
                                  patch_discrim_config=patch_discrim_config, auto_encoder_training_config=auto_encoder_training_config,
                                  WANDB_LOG_IMAGES=WANDB_LOG_IMAGES,
                                  evaluation_intervall=run_config["evaluation_intervall"],
-                                 starting_epoch=0
+                                 starting_epoch=20
                                  )
     
     with Stopwatch("Training took: "):
@@ -176,7 +187,6 @@ with Stopwatch("Evaluating Autoencoder took: "):
     evaluator.evaluate()
     del evaluator
 
-diffusion_model = SPADEDiffusionModelUNet(**diffusion_model_unet_config).to(device)
 training_scheduler = DDPMScheduler(num_train_timesteps=1000,
                           schedule="scaled_linear_beta",
                           beta_start=0.0015, 
@@ -192,9 +202,19 @@ evaluation_scheduler = DDIMScheduler(
 evaluation_scheduler.set_timesteps(num_inference_steps=25)
 
 # We define the inferer using the scale factor:
-scale_factor = get_scale_factor(autoencoder=autoencoder, sample_data=sample_data["image"].to(device))
+scale_factor = get_scale_factor(autoencoder=autoencoder, sample_data=iter(train_loader).__next__()["image"].to(device), is_mask=False)
 inferer = LatentDiffusionInferer(training_scheduler, scale_factor=scale_factor)
 
+
+diffusion_model = SPADEDiffusionModelUNet(**diffusion_model_unet_config).to(device)
+
+# update batch-size for diffusion model
+train_loader = DataLoader(train_ds, batch_size=diffusion_model_training_config["batch_size"], shuffle=True, num_workers=2, drop_last=True, persistent_workers=True)
+valid_loader = DataLoader(validation_ds, batch_size=diffusion_model_training_config["batch_size"], shuffle=True, num_workers=2, drop_last=True, persistent_workers=True)
+encoding_shape = list(encoding_shape)
+encoding_shape[0] = diffusion_model_training_config["batch_size"]
+encoding_shape = tuple(encoding_shape)
+LOGGER.info(f"Encoding shape with updated batch-size for diffusion training: {encoding_shape}")
 
 # this should perhaps include also the autoencoder configs
 if not load_model_from_run_with_matching_config([run_config, diffusion_model_unet_config, diffusion_model_training_config],
@@ -217,7 +237,7 @@ if not load_model_from_run_with_matching_config([run_config, diffusion_model_une
         encoding_shape=encoding_shape,
         diffusion_model_training_config=diffusion_model_training_config,
         evaluation_intervall=run_config["evaluation_intervall"],
-        evaluation_scheduler=evaluation_scheduler
+        evaluation_scheduler=evaluation_scheduler,
     )
     
     with Stopwatch("Training took: "):
@@ -228,7 +248,7 @@ if not load_model_from_run_with_matching_config([run_config, diffusion_model_une
     del optimizer_diff
     del grad_scaler
 
-    save_model_as_artifact(wandb_run, diffusion_model, type(diffusion_model).__name__, auto_encoder_config)
+    save_model_as_artifact(wandb_run, diffusion_model, type(diffusion_model).__name__, diffusion_model_unet_config)
 else:
     LOGGER.info("Loaded existing diffusion model")
 
@@ -245,3 +265,7 @@ evaluator = SpadeDiffusionModelEvaluator(
 
 evaluator.log_samples(5, True)
 evaluator.log_samples(5, False)
+
+wandb.finish()
+
+LOGGER.info("Finished Run!")
