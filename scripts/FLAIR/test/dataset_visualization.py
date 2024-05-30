@@ -12,22 +12,13 @@ from monai import transforms
 from monai.utils import set_determinism
 
 
-from src.util import Stopwatch, read_config
 from src.logging_util import LOGGER
-from src.datasets import get_dataloader
 
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 LOGGER.info(f"Device count: {torch.cuda.device_count()}", )
 LOGGER.info(f"Device: {device}")
-
-
-WANDB_LOG_IMAGES = os.environ.get("WANDB_LOG_IMAGES")
-WANDB_RUN_NAME = os.environ.get("WANDB_RUN_NAME")
-
-experiment_config = read_config(os.environ.get("EXPERIMENT_CONFIG"))
-run_config = experiment_config["run"]
 
 # for reproducibility purposes set a seed
 set_determinism(42)
@@ -107,10 +98,19 @@ colors = ["orange", "green", "purple"]
 all_volumes = list(results.values())
 labels = list(results.keys())
 
-plt.stackplot(range(len(all_volumes[0])), *all_volumes, labels=labels, colors=colors, alpha=0.6)
+import seaborn
+import pandas as pd
 
-lgd = plt.legend(loc="center left", bbox_to_anchor=(1, 0.5))
-plt.xticks([])
-plt.xlabel("Patients")
-plt.ylabel("Ventricular Volume in ml")
-plt.savefig("../output/volumes_stackplot.png", bbox_extra_artists=[lgd], bbox_inches="tight")
+df_results = pd.DataFrame.from_dict(results)
+
+
+plot = seaborn.displot(data=df_results, kind="kde", cut=0, fill=True)
+
+
+
+#lgd = plt.legend(loc="center left", bbox_to_anchor=(1, 0.5))
+#plt.xticks([])
+#plt.xlabel("Patients")
+plt.xlabel("Ventricular Volume in mL", fontsize="16")
+plt.ylabel("Density", fontsize="16")
+plot.savefig("../output/volumes_density.png")

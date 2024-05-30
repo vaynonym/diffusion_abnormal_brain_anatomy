@@ -39,14 +39,19 @@ from src.datasets import get_crop_around_mask_center
 target_spacing = run_config["target_spacing"]
 crop_size = run_config["input_image_crop_roi"]
 
+def peek(d):
+    print("peek image_shape", d["image"].shape)
+    print("peek mask_shape", d["mask"].shape)
+    return d
+
 base_transforms = transforms.Compose([
-        transforms.LoadImaged(keys=["image", "mask"]),
-        transforms.EnsureChannelFirstd(keys=["image", "mask"]),
-        transforms.EnsureTyped(keys=["image", "mask"]),
+        transforms.LoadImaged(keys=["image", "mask", "synthseg_mask"]),
+        transforms.EnsureChannelFirstd(keys=["image", "mask", "synthseg_mask"]),
+        transforms.EnsureTyped(keys=["image", "mask", "synthseg_mask"]),
         transforms.Lambdad(keys=["image"], func=lambda x: x[0, :, :, :].unsqueeze(0)), # select first channel if multiple channels occur
 
-        transforms.Orientationd(keys=["image", "mask"], axcodes="IPR"), # IAR # axcodes="RAS"
-        transforms.Spacingd(keys=["mask"], pixdim=target_spacing, mode=("nearest")),
+        transforms.Orientationd(keys=["image", "mask", "synthseg_mask"], axcodes="IPR"), # IAR # axcodes="RAS"
+        transforms.Spacingd(keys=["mask", "synthseg_mask"], pixdim=target_spacing, mode=("nearest")),
         transforms.Spacingd(keys=["image"], pixdim=target_spacing, mode=("bilinear")),
         transforms.Lambda(func=get_crop_around_mask_center(crop_size)),
         transforms.ScaleIntensityRangePercentilesd(keys=["image"], lower=0.5, upper=99.5, b_min=0, b_max=1, clip=True),
@@ -56,9 +61,11 @@ base_transforms = transforms.Compose([
 LOGGER.info("Loading dataset...")
 dataset_preparation_stopwatch = Stopwatch("Done! Loading the Dataset took: ").start()
 
-from src.datasets import RHFlairTestDataset
+from src.datasets import RHNPHFlairTestDataset, RH3DFlairTestDataset
 
-ds = RHFlairTestDataset(dataset_path="/depict/users/tim/private/final_testset", transform=base_transforms, size=50, cache_rate=1.0, num_workers=4)
+ds = RH3DFlairTestDataset(dataset_path="/depict/users/tim/private/2nd_final_testset_3D/TIM_testset2", transform=base_transforms, size=50, cache_rate=1.0, num_workers=4)
+
+#ds = RHNPHFlairTestDataset(dataset_path="/depict/users/tim/private/final_testset", transform=base_transforms, size=50, cache_rate=1.0, num_workers=4)
 print(f"Loaded DS {ds.__class__.__name__}")
 
 import numpy as np
@@ -75,15 +82,24 @@ dataset_preparation_stopwatch.stop().display()
 
 LOGGER.info(f"Train length: {len(ds)} in {len(train_loader)} batches")
 LOGGER.info(f'Mask shape {ds[0]["mask"].shape}')
+LOGGER.info(f"synthseg_mask shape:" , next(iter(train_loader))["synthseg_mask"].shape)
 
 
 from src.directory_management import OUTPUT_DIRECTORY
 
-base_path = os.path.join(OUTPUT_DIRECTORY, "Task809_TestRealBrainFlair")
+base_path = os.path.join(OUTPUT_DIRECTORY, "Task810_Test2RealBrainFlair")
+
+if not os.path.exists(base_path):
+    LOGGER.error("Base path does not exist")
+    quit()
+
 mask_path = os.path.join(base_path, "labelsTr")
 os.makedirs(mask_path, exist_ok=True)
 image_path = os.path.join(base_path, "imagesTr")
 os.makedirs(image_path, exist_ok=True)
+
+synseg_path = os.path.join(base_path, "synthseg_labels")
+os.makedirs(synseg_path, exist_ok=True)
 
 CHANNEL_IDENTIFIER = 0
 EXTENSION = ".nii.gz"
@@ -102,6 +118,12 @@ save_mask = transforms.SaveImage(mask_tmp_save_path, output_ext=EXTENSION,
                                   separate_folder=False, output_postfix="mask", 
                                   output_dtype=np.int8, print_log=False, savepath_in_metadict=True)
 
+synthseg_mask_tmp_save_path = os.path.join(base_path, "tmp_synthseg_masks")
+os.makedirs(synthseg_mask_tmp_save_path, exist_ok=True)
+save_synthseg_mask = transforms.SaveImage(synthseg_mask_tmp_save_path, output_ext=EXTENSION, 
+                                  separate_folder=False, output_postfix="mask", 
+                                  output_dtype=np.int8, print_log=False, savepath_in_metadict=True)
+
 
 
 from src.util import visualize_3d_image_slice_wise
@@ -112,6 +134,8 @@ from tqdm import tqdm
 from monai.data.meta_tensor import MetaTensor
 from pprint import pprint
 
+def flip_left_right(tensor):
+    return torch.flip(tensor, dims=[2])
 
 for case_identifier, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
     image : MetaTensor = batch["image"][0]
@@ -140,21 +164,29 @@ for case_identifier, batch in tqdm(enumerate(train_loader), total=len(train_load
     assert (raw_mask.affine == image.affine).all()
 
 
-    mask_tmp_file_name = save_mask(raw_mask, None).meta["saved_to"]
-    NN_UNet_mask_filename = f"FLAIR-{sub_path}{nnunet_mask_postfix}"
-    NN_UNet_mask_Pathname = os.path.join(base_path, "labelsTr", NN_UNet_mask_filename)
-    os.rename( mask_tmp_file_name, NN_UNet_mask_Pathname)
+    #mask_tmp_file_name = save_mask(raw_mask, None).meta["saved_to"]
+    #NN_UNet_mask_filename = f"FLAIR-{sub_path}{nnunet_mask_postfix}"
+    #NN_UNet_mask_Pathname = os.path.join(base_path, "labelsTr", NN_UNet_mask_filename)
+    #os.rename( mask_tmp_file_name, NN_UNet_mask_Pathname)
     
     
-    image_tmp_file_name = save_image(image, None).meta["saved_to"]
-    NN_UNet_image_filename = f"FLAIR-{sub_path}" + f"{nnunet_image_postfix}"
-    NN_UNet_image_Pathname = os.path.join(base_path, "imagesTr", NN_UNet_image_filename)
-    os.rename(image_tmp_file_name, NN_UNet_image_Pathname)
+    #image_tmp_file_name = save_image(image, None).meta["saved_to"]
+    #NN_UNet_image_filename = f"FLAIR-{sub_path}" + f"{nnunet_image_postfix}"
+    #NN_UNet_image_Pathname = os.path.join(base_path, "imagesTr", NN_UNet_image_filename)
+    #os.rename(image_tmp_file_name, NN_UNet_image_Pathname)
+
+    if "synthseg_mask" in batch:
+        synthseg_mask: MetaTensor = batch["synthseg_mask"][0]
+
+        synthseg_mask_tmp_file_name = save_synthseg_mask(synthseg_mask, None).meta["saved_to"]
+        NN_UNet_synthseg_filename = f"FLAIR-{sub_path}" + f"{nnunet_mask_postfix}"
+        NN_UNet_synthseg_Pathname = os.path.join(base_path, "synthseg_labels", NN_UNet_synthseg_filename)
+        os.rename(synthseg_mask_tmp_file_name, NN_UNet_synthseg_Pathname)
 
 
-    visualize_3d_image_slice_wise(image[0], base_path + f"/{sub_path}_img.png", description_prefix="", log_to_wandb=False, conditioning_information=None)
-    visualize_3d_image_slice_wise(mask[0], base_path + f"/{sub_path}_mask.png", description_prefix="", log_to_wandb=False, conditioning_information=None,
-                                    is_image_mask=True)
+    #visualize_3d_image_slice_wise(image[0], base_path + f"/{sub_path}_img.png", description_prefix="", log_to_wandb=False, conditioning_information=None)
+    #visualize_3d_image_slice_wise(mask[0], base_path + f"/{sub_path}_mask.png", description_prefix="", log_to_wandb=False, conditioning_information=None,
+    #                                is_image_mask=True)
     
 
 

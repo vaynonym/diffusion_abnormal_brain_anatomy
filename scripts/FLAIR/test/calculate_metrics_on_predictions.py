@@ -58,8 +58,14 @@ prediction_models = {
  "Synthetic": "801"
 }
 
-dataset_path = "/depict/users/tim/private/correct_masks/nnUNet_raw/Task809_TestRealBrainFlair"
+#dataset_path = "/depict/users/tim/private/correct_masks/nnUNet_raw/Task809_TestRealBrainFlair"
+dataset_path = "/depict/users/tim/private/correct_masks/nnUNet_raw/Task808_ValidationRealBrainFlair"
+
 ground_truth_path = os.path.join(dataset_path, "labelsTr")
+synthseg_path = os.path.join(dataset_path, "synthseg_labels")
+
+if not os.path.exists(synthseg_path):
+    synthseg_path = None
 
 model_prediction_folder_prefix = "predictions_"
 
@@ -117,11 +123,11 @@ from collections import defaultdict
 scores_IoU = defaultdict(lambda: [])
 scores_Dice = defaultdict(lambda: [])
 
-from torchmetrics.classification import Dice, MulticlassJaccardIndex as IoU
+from torchmetrics.classification import MulticlassF1Score, MulticlassJaccardIndex as IoU
 
 
-dice_score = Dice(len(index_to_classes_test_set), ignore_index=0, average=None)
-iou_score = IoU(num_classes=len(index_to_classes_test_set), ignore_index=0, average=None)
+dice_score = MulticlassF1Score(len(index_to_classes_test_set),  average=None)
+iou_score = IoU(num_classes=len(index_to_classes_test_set),  average=None)
 
 from src.synthseg_masks import decode_one_hot, encode_contiguous_labels_one_hot
 
@@ -129,6 +135,15 @@ from src.synthseg_masks import decode_one_hot, encode_contiguous_labels_one_hot
 for label_file_name in tqdm(label_file_names):
 
     GT_mask = transforms.LoadImaged(keys="mask")({"mask": os.path.join(ground_truth_path, label_file_name)})["mask"].int().unsqueeze(0).unsqueeze(0)
+    GT_mask = decode_one_hot(encode_contiguous_labels_one_hot(GT_mask))
+    GT_mask = match_ventricle_labels_from_synthseg(GT_mask).cpu().detach().int()
+
+    if synthseg_path is not None:
+        synthseg_mask = transforms.LoadImaged(keys="synthseg_mask")({"synthseg_mask": os.path.join(synthseg_path, label_file_name)})["synthseg_mask"].int().unsqueeze(0).unsqueeze(0)
+        synthseg_mask = match_ventricle_labels_from_synthseg(synthseg_mask.to(device)).cpu().detach().int()
+
+        scores_Dice["synthseg"].append(dice_score(synthseg_mask, GT_mask).cpu().numpy())
+        scores_IoU["synthseg"].append(iou_score(synthseg_mask, GT_mask).cpu().numpy())
 
     for name, index in prediction_models.items():
         prediction_mask_path = os.path.join(dataset_path, model_prediction_folder_prefix + index, label_file_name)
@@ -139,26 +154,33 @@ for label_file_name in tqdm(label_file_names):
 
         scores_Dice[name].append(dice_score(prediction_mask, GT_mask).cpu().numpy())
         scores_IoU[name].append(iou_score(prediction_mask, GT_mask).cpu().numpy())
-        visualize_3d_image_slice_wise(prediction_mask[0][0], OUTPUT_DIRECTORY + f"/{label_file_name}_{name}.png", description_prefix="", log_to_wandb=False, conditioning_information=None,
-                                    is_image_mask=True)
+        #visualize_3d_image_slice_wise(prediction_mask[0][0], OUTPUT_DIRECTORY + f"/{label_file_name}_{name}.png", description_prefix="", log_to_wandb=False, conditioning_information=None,
+        #                            is_image_mask=True)
 
 
-    visualize_3d_image_slice_wise(GT_mask[0][0], OUTPUT_DIRECTORY + f"/{label_file_name}_GT.png", description_prefix="", log_to_wandb=False, conditioning_information=None,
-                                    is_image_mask=True)
+    #visualize_3d_image_slice_wise(GT_mask[0][0], OUTPUT_DIRECTORY + f"/{label_file_name}_GT.png", description_prefix="", log_to_wandb=False, conditioning_information=None,
+    #                                is_image_mask=True)
     
+names = list(prediction_models.keys())
 
-for name in prediction_models:
+if synthseg_path is not None:
+    names.append("synthseg")
+
+for name in names:
     mean_dice = np.mean(scores_Dice[name], axis=0)
     std_dice = np.std(scores_Dice[name], axis=0)
     mean_iou = np.mean(scores_IoU[name], axis=0)
     std_iou = np.std(scores_IoU[name], axis=0)
 
-    print(mean_dice.shape)
+    #print(mean_dice.shape)
     LOGGER.info("=====================")
     LOGGER.info(f"{name}")
+
+    #LOGGER.info(f"{name}: dice={mean_dice:.03f}+-{std_dice:.03f}, IoU={mean_iou:.03f}+-{std_iou:.03f}")
+
     for c, c_name in index_to_classes_test_set.items():
         if c == 0: continue
         
-        LOGGER.info(f"{c_name}: dice={mean_dice[c - 1]:.03f}+-{std_dice[c - 1]:.03f}, IoU={mean_iou[c - 1]:.03f}+-{std_iou[c - 1]:.03f}")
+        LOGGER.info(f"{c_name}: dice={mean_dice[c]:.03f}+-{std_dice[c]:.03f}, IoU={mean_iou[c]:.03f}+-{std_iou[c]:.03f}")
 
     
