@@ -149,13 +149,13 @@ from src.colors import default_mask_colors
 
 # setting path to None means no graph will be created and only images logged
 def visualize_3d_image_slice_wise(img: MetaTensor, path, description_prefix="", log_to_wandb=False, conditioning_information=None, is_image_mask=False):
-    axial = img[..., img.shape[2] // 2]
-    coronal = img[:, img.shape[1] // 2, ...]
-    sagittal = img[img.shape[0] // 2, ...]
+    axial = img[..., img.shape[2] // 2  - 20]
+    coronal = img[:, img.shape[1] // 2 - 20, ...]
+    sagittal = img[img.shape[0] // 2 - 20, ...]
 
     fig, axs = plt.subplots(nrows=1, ncols=3, figsize=(16, 4), constrained_layout=False)
-
-    fig.suptitle(f"N. Ventricle Volume: {round(conditioning_information.item(), 3)}")
+    if conditioning_information is not None:
+        fig.suptitle(f"N. Ventricle Volume: {round(conditioning_information.item(), 3)}")
 
     for ax in axs:
         ax.axis("off")
@@ -166,11 +166,11 @@ def visualize_3d_image_slice_wise(img: MetaTensor, path, description_prefix="", 
             axs[i].imshow(colored_mask)
     else:
         ax = axs[0]
-        ax.imshow(axial, cmap="gray")
+        ax.imshow(np.clip(axial, 0., 1.), cmap="gray")
         ax = axs[1]
-        ax.imshow(coronal, cmap="gray")
+        ax.imshow(np.clip(coronal, 0., 1.), cmap="gray")
         ax = axs[2]
-        ax.imshow(sagittal, cmap="gray")
+        ax.imshow(np.clip(sagittal, 0., 1.), cmap="gray")
     if path:
         plt.savefig(path)
 
@@ -179,7 +179,10 @@ def visualize_3d_image_slice_wise(img: MetaTensor, path, description_prefix="", 
         # suppress warning "Images sizes do not match. This will causes images to be display incorrectly in the UI" as it's not actually a problem
         with all_logging_disabled():
             wandb.log({description_prefix: plt}) 
-    
+
+    for i in range(3):
+        axs[i].clear()
+    fig.clf()
     plt.cla()
     plt.clf()
 
