@@ -88,6 +88,8 @@ class SyntheticLDM100K(Randomizable, CacheDataset, VolumeDataset):
         self.datalist = []
         volumes = []
 
+        LOGGER.info("Loading LDM100k Synthetic Dataset")
+
         tsv_volumes = []
         with open(path.join(dataset_path, "participants.tsv"), "r") as participantsCSV:
             reader = csv.reader(participantsCSV, delimiter='\t')
@@ -235,7 +237,7 @@ def get_dataloader(data: Dataset, run_config: dict):
         return DataLoader(data, 
                       batch_size=run_config["batch_size"],
                       shuffle=True,
-                      num_workers=2,
+                      num_workers=4,
                       drop_last=True,
                       persistent_workers=True)
 
@@ -378,10 +380,15 @@ class RHFlairDataset(Randomizable, CacheDataset, VolumeDataset):
         skipped_because_no_slice_thickness = []
         skipped_because_slice_thickness_too_high = []
 
+        IDs_used = []
+
+        col_0s = set()
+
         import tqdm
 
         for rel_patient_path in tqdm.tqdm(os.listdir(dataset_path), desc="Collecting files and volumes..."):
             patient_path = os.path.join(dataset_path, rel_patient_path)
+            used_at_least_once = False
             for rel_scan_path in os.listdir(patient_path):
                 scan_path = os.path.join(patient_path, rel_scan_path)
 
@@ -409,8 +416,9 @@ class RHFlairDataset(Randomizable, CacheDataset, VolumeDataset):
                     MRAcquisitionType.add(json_f["MRAcquisitionType"])
 
                 volume_df = pd.read_csv(volumes_file)
-                assert (volume_df["subject"] == "FLAIR").all()
-                volume_df = volume_df.drop("subject", axis=1)
+                assert (volume_df.iloc[:, 0] == "FLAIR").all()
+                col_0s.add(volume_df.columns[0])
+                volume_df = volume_df.drop(volume_df.columns[0], axis=1)
 
                 if volume_df.shape[0] != 1:
                     #too_many_volumes.append(scan_path)
@@ -437,7 +445,10 @@ class RHFlairDataset(Randomizable, CacheDataset, VolumeDataset):
                 })
                 volumes.append(relative_volume)
 
+                used_at_least_once = True
                 if len(self.datalist) >= size: break
+            if used_at_least_once:
+                IDs_used.append(rel_patient_path)
             if len(self.datalist) >= size: break
 
         self.analyze_raw_volumes()
@@ -513,7 +524,7 @@ class RHFlairDataset(Randomizable, CacheDataset, VolumeDataset):
 dataset_map = {
     "RH_FLAIR": (RHFlairDataset, 
                  {
-                    "num_workers": 8,
+                    "num_workers": 16,
                     "dataset_path": FLAIR_DATASET_DIRECTORY,
 
                  }
@@ -541,7 +552,7 @@ def load_dataset_from_config(run_config, section, transforms):
         return dataset_constructor(
                 section=section,
                 size=run_config["dataset_size"],
-                cache_rate=1.0,  # you may need a few Gb of RAM... Set to 0 otherwise
+                cache_rate=0.5,  # you may need a few Gb of RAM... Set to 0 otherwise
                 seed=0,
                 transform=transforms,
                 **kwargs,
@@ -572,7 +583,7 @@ def load_dataset_from_config(run_config, section, transforms):
             DS = dataset_constructor(
                     section=section,
                     size=size,
-                    cache_rate=0.7,  # you may need a few Gb of RAM... Set to 0 otherwise
+                    cache_rate=0.5,  # you may need a few Gb of RAM... Set to 0 otherwise
                     seed=0,
                     transform=transforms[i],
                     max_volume=max_volume,
@@ -620,23 +631,6 @@ def get_default_transforms(run_config, guidance):
 
 def get_default_transforms_RH_FLAIR(target_spacing, crop_size, guidance):
     LOGGER.info("Using default transform from RH_FLAIR")
-    #from monai.data import MetaTensor
-    #from monai.data.utils import affine_to_spacing
-
-#    def update_spacing(d):
-#        img: MetaTensor = d["image"]
-#
-#        spacing = affine_to_spacing(img.affine)
-#
-#        #print(spacing, sep=' | ')
-#
-#        if (spacing > 2.0).any():
-#            LOGGER.info(f"Spacing unexpectedly too large: {spacing}")
-#
-#        return d
-
-        
-        
 
     base_transforms = [
             transforms.LoadImaged(keys=["image", "mask"]),
@@ -644,8 +638,7 @@ def get_default_transforms_RH_FLAIR(target_spacing, crop_size, guidance):
             transforms.EnsureTyped(keys=["image", "mask"]),
             transforms.Lambdad(keys=["image"], func=lambda x: x[0, :, :, :].unsqueeze(0)), # select first channel if multiple channels occur
 
-            transforms.Orientationd(keys=["image", "mask"], axcodes="IPR"), # IAR # axcodes="RAS"
-            #transforms.Lambda(func=update_spacing),
+            transforms.Orientationd(keys=["image", "mask"], axcodes="IAR"),# IPR # IAR # axcodes="RAS"
             transforms.Spacingd(keys=["mask"], pixdim=target_spacing, mode=("nearest")),
             transforms.Spacingd(keys=["image"], pixdim=target_spacing, mode=("bilinear")),
 
@@ -670,7 +663,7 @@ def get_default_transforms_LDM100k(target_spacing, crop_size, guidance):
         transforms.LoadImaged(keys=["mask", "image"]),
         transforms.EnsureChannelFirstd(keys=["mask", "image"]),
         transforms.EnsureTyped(keys=["mask", "image"]),
-        transforms.Orientationd(keys=["mask", "image"], axcodes="IPR"), # axcodes="RAS"
+        transforms.Orientationd(keys=["mask", "image"], axcodes="IPL"), # axcodes="RAS"
         transforms.Spacingd(keys=["mask"], pixdim=target_spacing, mode=("nearest")),
         transforms.Spacingd(keys=["image"], pixdim=target_spacing, mode=("bilinear")),
         transforms.CenterSpatialCropd(keys=["mask", "image"], roi_size=crop_size),
@@ -692,3 +685,187 @@ def get_default_transforms_LDM100k(target_spacing, crop_size, guidance):
     valid_transforms = transforms.Compose(base_transforms)
 
     return train_transforms, valid_transforms
+
+
+
+class RHNPHFlairTestDataset(CacheDataset):
+    def __init__(
+        self,
+        dataset_path,
+        transform,
+        size=50,
+        cache_num=sys.maxsize,
+        cache_rate=1.0,
+        num_workers=0,
+    ):
+        if not path.isdir(dataset_path):
+            raise ValueError("Root directory root_dir must be a directory.")
+
+        self.datalist = []
+
+        import tqdm
+        from typing import List
+
+        def find_file(files: List[str], beginning, ending, keyword):
+            if beginning is not None:
+                files = [file for file in files if file.startswith(beginning)]
+            
+            if ending is not None:
+                files = [file for file in files if file.endswith(ending)]
+            
+            if keyword is not None:
+                files = [file for file in files if keyword in file]
+            
+            if len(files) == 0:
+                LOGGER.warning(f"Could not find [{beginning}, {ending}, {keyword}] in {files}")
+                return None
+
+            
+            if len(files) > 1:
+                LOGGER.warning(f"Multipl files for [{beginning}, {ending}, {keyword}] in {files}")
+            
+            return files[0]
+
+
+        for rel_patient_path in tqdm.tqdm(os.listdir(dataset_path), desc="Collecting files and volumes..."):
+            patient_path = os.path.join(dataset_path, rel_patient_path)
+
+            for rel_scan_path in os.listdir(patient_path):
+                scan_path = os.path.join(patient_path, rel_scan_path)
+                all_files = os.listdir(scan_path)
+
+                mask_file = find_file(all_files, beginning=None, ending=".nii", keyword="Annika")
+                if mask_file is None:
+                    continue
+
+                image_file = find_file(all_files, beginning=None, ending="FLAIR.nii.gz", keyword=None)
+                if image_file is None:
+                    continue
+
+                synthseg_mask_file = find_file(all_files, beginning=None, ending="FLAIR_synthseg.nii.gz", keyword=None)
+                
+                if synthseg_mask_file is None:
+                    LOGGER.warn("No synthseg mask found!")
+
+
+                self.datalist.append({
+                    "image": os.path.join(scan_path, image_file),
+                    "mask": os.path.join(scan_path, mask_file),
+                    "case_identifier": f"{rel_patient_path}-{rel_scan_path}",
+                    "synthseg_mask": os.path.join(scan_path, synthseg_mask_file)
+                })
+
+                if len(self.datalist) >= size: break
+            if len(self.datalist) >= size: break
+
+
+        print("Generate data list")
+        data = [x for x in self.datalist]
+        print("Generated data list")
+
+        super().__init__(
+            data,
+            transform,
+            cache_num=cache_num,
+            cache_rate=cache_rate,
+            num_workers=num_workers,
+        )
+
+
+
+
+class RH3DFlairTestDataset(CacheDataset):
+    IGNORE_LIST = []
+
+    def __init__(
+        self,
+        dataset_path,
+        transform,
+        size=50,
+        cache_num=sys.maxsize,
+        cache_rate=1.0,
+        num_workers=0,
+    ):
+        if not path.isdir(dataset_path):
+            raise ValueError("Root directory root_dir must be a directory.")
+
+        self.datalist = []
+
+        import tqdm
+        from typing import List
+
+        def find_file(files: List[str], beginning, ending, keyword):
+            if beginning is not None:
+                files = [file for file in files if file.startswith(beginning)]
+            
+            if ending is not None:
+                files = [file for file in files if file.endswith(ending)]
+            
+            if keyword is not None:
+                files = [file for file in files if keyword in file]
+            
+            if len(files) == 0:
+                LOGGER.warning(f"Could not find [{beginning}, {ending}, {keyword}] in {files}")
+                return None
+
+            
+            if len(files) > 1:
+                LOGGER.warning(f"Multipl files for [{beginning}, {ending}, {keyword}] in {files}")
+            
+            return files[0]
+
+        prefix_segmentations = "derivatives/delineations"
+        prefix_images = "rawdata"
+        image_additional_subpath = "anat"
+
+        for rel_patient_path in tqdm.tqdm(os.listdir(os.path.join(dataset_path, prefix_segmentations)), desc="Collecting files and volumes..."):
+            patient_path = os.path.join(dataset_path, prefix_segmentations, rel_patient_path)
+            
+            assert len(os.listdir(patient_path)) == 1
+
+            if rel_patient_path in RH3DFlairTestDataset.IGNORE_LIST:
+                continue
+
+            for rel_scan_path in os.listdir(patient_path):
+                scan_path = os.path.join(patient_path, rel_scan_path)
+                all_files = os.listdir(scan_path)
+
+                mask_file = find_file(all_files, beginning=None, ending=None, keyword="expert")
+
+                if mask_file is None:
+                    mask_file = find_file(all_files, beginning=None, ending=None, keyword="student")
+                    if mask_file is None:
+                        LOGGER.warn(f"Unexpected missing segmentation in {all_files}")
+                
+                image_folder = os.path.join(dataset_path, prefix_images, rel_patient_path, rel_scan_path, image_additional_subpath)
+
+                image_file = find_file(os.listdir(image_folder), beginning=None, ending="FLAIR.nii.gz", keyword=None)
+                synthseg_mask_file = find_file(os.listdir(image_folder), beginning=None, ending="FLAIR_synthseg_mask.nii.gz", keyword=None)
+
+                if image_file is None:
+                    LOGGER.warn("Unexpected missing image")
+                    raise Exception("Unexpected missing image")
+
+                if synthseg_mask_file is None:
+                    raise Exception("Unexpected missing synthseg mask")
+
+                self.datalist.append({
+                    "image": os.path.join(image_folder, image_file),
+                    "mask": os.path.join(scan_path, mask_file),
+                    "synthseg_mask": os.path.join(image_folder, synthseg_mask_file),
+                    "case_identifier": f"{rel_patient_path}-{rel_scan_path}",
+                })
+
+                if len(self.datalist) >= size: break
+            if len(self.datalist) >= size: break
+
+
+        data = [x for x in self.datalist]
+
+        super().__init__(
+            data,
+            transform,
+            cache_num=cache_num,
+            cache_rate=cache_rate,
+            num_workers=num_workers,
+        )

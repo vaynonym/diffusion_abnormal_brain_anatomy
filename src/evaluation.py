@@ -23,7 +23,7 @@ from src.custom_autoencoders import IAutoencoder
 from src.diffusion import ILatentDiffusionInferer
 from itertools import combinations
 from torch.nn import L1Loss
-
+import tqdm
 
 
 class AutoencoderEvaluator():
@@ -99,7 +99,7 @@ class AutoencoderEvaluator():
         accumulations = [[] for _ in self.metrics.keys()]
 
 
-        for i, batch in enumerate(self.val_loader):
+        for i, batch in enumerate(tqdm.tqdm(self.val_loader)):
             with torch.no_grad():
                 model_input = self.get_input_from_batch(batch)
                 ground_truth = self.get_input_for_evaluation_from_batch(model_input, batch)
@@ -290,7 +290,7 @@ class DiffusionModelEvaluator():
     @torch.no_grad()
     def get_real_features(self, dataloader: DataLoader):
         real_features = []
-        for i, batch in enumerate(dataloader):
+        for i, batch in enumerate(tqdm.tqdm(dataloader, desc="get real features")):
             real_images = self.get_input_from_batch(batch)["inputs"]
             with torch.no_grad():
                 
@@ -371,7 +371,7 @@ class DiffusionModelEvaluator():
         batch_size = self.latent_shape[0]
         synth_features = []
 
-        for i, batch in enumerate(self.val_loader):
+        for i, batch in enumerate(tqdm.tqdm(self.val_loader, desc="get_synthetic_features")):
             # Get the real images
 
             # Generate some synthetic images using the defined model
@@ -395,25 +395,16 @@ class DiffusionModelEvaluator():
 
         batch_size_multiplier = 1
 
-        combined_dataset = ConcatDataset([self.train_loader.dataset, self.val_loader.dataset])
-        combined_dataloader = DataLoader(
-                   dataset=combined_dataset,
-                   batch_size=self.train_loader.batch_size * batch_size_multiplier,
-                   shuffle=False,
-                   drop_last=self.train_loader.drop_last, 
-                   num_workers=1,
-                   persistent_workers=self.train_loader.persistent_workers,
-                   sampler=RandomSampler(combined_dataset, replacement=True, num_samples=count,)
-                   )
+        combined_dataloader = self.val_loader
         
         old_latent_shape = self.latent_shape
         # temporarily double batch size
         self.latent_shape = torch.Size([self.latent_shape[0] * batch_size_multiplier, *self.latent_shape[1:]])
 
-        diversity_metrics = list(zip(self.diversity_metrics, [[]] * len(self.diversity_metrics)))
+        diversity_metrics = list(zip(self.diversity_metrics, [[] for i in range(len(self.diversity_metrics))]))
 
         current_count = 0
-        for i, batch in enumerate(combined_dataloader):
+        for i, batch in enumerate(tqdm.tqdm(combined_dataloader)):
             # Get the real images
             # Generate some synthetic images using the defined model
             synthetic_images=self.get_synthetic_output(batch, True)
@@ -439,10 +430,10 @@ class DiffusionModelEvaluator():
         
         LOGGER.info(f"Number of batches for diversity metrics: { i + 1}")
 
-        results = {
-            f"{self.wandb_prefix}/{name}": torch.cat(scores, dim=0).mean().item() for (name, _), scores in diversity_metrics
-        }
-
+        results = {}
+        for ((name, _), div_scores) in diversity_metrics:
+            results[f"{self.wandb_prefix}/{name}"] = torch.cat(div_scores, dim=0).mean().item()
+        
         # return batch size to original value
         self.latent_shape = old_latent_shape
 
@@ -452,7 +443,7 @@ class DiffusionModelEvaluator():
     @torch.no_grad()
     def calculate_fid(self):
         real_features = self.get_real_features(self.val_loader)
-        synthetic_features = self.get_synthetic_features(100)
+        synthetic_features = self.get_synthetic_features(5000)
 
         fid = FIDMetric()(synthetic_features, real_features)
         return fid
@@ -465,7 +456,7 @@ class DiffusionModelEvaluator():
             fid = self.calculate_fid()
         results = {f"{self.wandb_prefix}/FID": fid.item()}
         with Stopwatch("Diversity metrics took: "):
-            diversity_metrics = self.calculate_diversity_metrics(100)
+            diversity_metrics = self.calculate_diversity_metrics(500)
 
         results.update(diversity_metrics)
         wandb.log(results)
@@ -581,7 +572,7 @@ class MaskDiffusionModelEvaluator(DiffusionModelEvaluator):
                 reconstruction_metrics = self.calculate_reconstruction_metrics()
                 results.update(reconstruction_metrics)
             with Stopwatch("Diversity metrics took: "):
-                diversity_metrics = self.calculate_diversity_metrics(100)
+                diversity_metrics = self.calculate_diversity_metrics(500)
                 results.update(diversity_metrics)
 
         wandb.log(results)
@@ -719,9 +710,11 @@ def create_fake_volume_dataloader(min_val, max_val, bucket_size, number_samples_
 
     fake_volume_dataset = TensorDataset(dataset)
 
+    LOGGER.info(f"FakeVolumeDataset has length {len(fake_volume_dataset)}")
+
     fake_volume_dataloader = DataLoader(fake_volume_dataset,
                                         batch_size=batch_size,
-                                        shuffle=True, num_workers=2,
+                                        shuffle=False, num_workers=2,
                                         drop_last=True,
                                         persistent_workers=True,
                                         collate_fn=collate_guidance if classifier_free_guidance is not None else collate)
