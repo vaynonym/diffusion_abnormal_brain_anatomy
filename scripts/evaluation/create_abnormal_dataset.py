@@ -10,7 +10,7 @@ from monai.utils import first, set_determinism
 from torch.cuda.amp import GradScaler, autocast
 
 from generative.inferers import LatentDiffusionInferer
-from generative.networks.nets import AutoencoderKL, DiffusionModelUNet
+from generative.networks.nets import DiffusionModelUNet
 from generative.networks.schedulers import DDPMScheduler, DDIMScheduler
 
 import numpy as np
@@ -18,6 +18,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 
+from src.custom_autoencoders import create_embedding_autoencoder
 from src.util import load_wand_credentials, Stopwatch, read_config, read_config_from_wandb_run
 from src.model_util import load_model_from_run_with_matching_config, load_model_from_run, check_dimensions
 from src.logging_util import LOGGER
@@ -26,7 +27,7 @@ from src.datasets import SyntheticLDM100K, get_dataloader
 
 from src.diffusion import get_scale_factor
 from src.custom_autoencoders import EmbeddingWrapper
-from src.synthseg_masks import synthseg_classes, central_areas_close_to_ventricles_indices, ventricle_indices, white_matter_indices, cortex_indices, CSF_indices, background_indices, decode_one_hot
+from src.synthseg_masks import central_areas_close_to_ventricles_indices, ventricle_indices, white_matter_indices, cortex_indices, CSF_indices, background_indices, decode_one_hot
 from src.evaluation import MaskDiffusionModelEvaluator
 
 
@@ -66,7 +67,7 @@ diffusion_model_training_config = experiment_config["diffusion_model_unet_traini
 
 check_dimensions(run_config, auto_encoder_config, diffusion_model_unet_config)
 
-diffusion_model_training_config["classifier_free_guidance"] = 4.0
+diffusion_model_training_config["classifier_free_guidance"] = 3.0
 CLASSIFIER_FREE_GUIDANCE = diffusion_model_training_config["classifier_free_guidance"] if "classifier_free_guidance" in diffusion_model_training_config else None
 LOGGER.info(f"Using classifier free guidance: {CLASSIFIER_FREE_GUIDANCE}")
 
@@ -80,11 +81,6 @@ LOGGER.info(f"Image shape: {image_shape}")
 dim_xyz = tuple(map(lambda x: x // down_sampling_factor, run_config["input_image_crop_roi"]))
 
 LOGGER.info("Loading models...")
-
-def create_embedding_autoencoder(*args, **kwargs):
-    base_autoencoder = AutoencoderKL(*args, **kwargs)
-    autoencoder = EmbeddingWrapper(base_autoencoder=base_autoencoder, vocabulary_size=max(synthseg_classes) + 1, embedding_dim=64)
-    return autoencoder
 
 autoencoder = load_model_from_run(run_id=WANDB_AUTOENCODER_RUNID, project=project, entity=entity,
                                   #model_class=AutoencoderKL,
@@ -100,6 +96,46 @@ diffusion_model = load_model_from_run(run_id=WANDB_DIFFUSIONMODEL_RUNID, project
                                       create_model_from_config=None
                                      )
 
+val_transforms = transforms.Compose(
+    [
+        transforms.LoadImaged(keys=["mask", "image"]),
+        transforms.EnsureChannelFirstd(keys=["mask", "image"]),
+        transforms.EnsureTyped(keys=["mask", "image"]),
+        transforms.Orientationd(keys=["mask", "image"], axcodes="IPL"), # axcodes="RAS"
+        transforms.Spacingd(keys=["mask"], pixdim=run_config["input_image_downsampling_factors"], mode=("nearest")),
+        transforms.Spacingd(keys=["image"], pixdim=run_config["input_image_downsampling_factors"], mode=("bilinear")),
+        transforms.CenterSpatialCropd(keys=["mask", "image"], roi_size=run_config["input_image_crop_roi"]),
+        transforms.ScaleIntensityRangePercentilesd(keys=["image"], lower=0.5, upper=99.5, b_min=0, b_max=1, clip=True),
+        transforms.Lambdad(keys=["volume"], func = lambda x: torch.tensor(x, dtype=torch.float32).unsqueeze(0).unsqueeze(0)),
+                # Use extra conditioning variable to signify conditioned or non-conditioned case
+        transforms.Lambdad(keys=["volume"], 
+                           func = lambda x: (torch.tensor([x, 1.], dtype=torch.float32) 
+                                             if CLASSIFIER_FREE_GUIDANCE 
+                                             else torch.tensor([x], dtype=torch.float32)).unsqueeze(0)),
+    ]
+)
+
+dataset_size = 8
+
+validation_ds = SyntheticLDM100K(
+    dataset_path=os.path.join(DATA_DIRECTORY, "LDM_100k"),
+    section="training",  # validation
+    size=dataset_size,
+    cache_rate=1.0,  # you may need a few Gb of RAM... Set to 0 otherwise
+    num_workers=6,
+    seed=0,
+    transform=val_transforms,
+    sorted_by_volume=False
+)
+
+run_config["oversample_large_ventricles"]=False
+scale_factor_DL = get_dataloader(validation_ds, run_config)
+
+scale_factor = get_scale_factor(autoencoder=autoencoder, sample_data=next(iter(scale_factor_DL))["mask"].to(device), is_mask=True)
+
+del scale_factor_DL
+del validation_ds
+
 scheduler = DDPMScheduler(num_train_timesteps=1000, schedule="scaled_linear_beta", beta_start=0.0015, beta_end=0.0205, clip_sample=False)
 #scheduler = DDIMScheduler(num_train_timesteps=1000, schedule="scaled_linear_beta", beta_start=0.0015, beta_end=0.0205, clip_sample=False)
 #scheduler.set_timesteps(50)
@@ -107,16 +143,10 @@ scheduler = DDPMScheduler(num_train_timesteps=1000, schedule="scaled_linear_beta
 LOGGER.info(f"Using scheduler {scheduler.__class__.__name__} with timesteps {scheduler.num_inference_steps}")
 
 
-# scale_factor = get_scale_factor(autoencoder=autoencoder, sample_data=next(iter(valid_loader))["mask"].to(device))
 scale_factor = 1.0
 
 inferer = LatentDiffusionInferer(scheduler, scale_factor=scale_factor)
 
-# include abnormal values
-bucket_size = 0.1
-buckets = torch.tensor(np.arange(0, 1.6, bucket_size)).to(device)
-# ensure that every normal value is within 0 to 1 buckets, essentially making [0, 0.1], (0.1, 0.2], ..., (0.9, 1.0], (1.0, 1.1], ...
-buckets[0] = -0.001 
 
 down_sampling_factor = (2 ** (len(auto_encoder_config["num_channels"]) -1) )
 dim_xyz = tuple(map(lambda x: x // down_sampling_factor, run_config["input_image_crop_roi"]))
@@ -124,7 +154,9 @@ encoding_shape = (run_config["batch_size"], auto_encoder_config["latent_channels
 
 from src.evaluation import create_fake_volume_dataloader
 
-volume_dataloader = create_fake_volume_dataloader(0.85, 1.6, 0.1, 1, classifier_free_guidance=CLASSIFIER_FREE_GUIDANCE, batch_size=run_config["batch_size"])
+volume_dataloader = create_fake_volume_dataloader(0.0, 1.4, 0.1, 25, 
+                                                  classifier_free_guidance=CLASSIFIER_FREE_GUIDANCE,
+                                                  batch_size=run_config["batch_size"])
 
 evaluator = MaskDiffusionModelEvaluator(
                 diffusion_model=diffusion_model,
@@ -153,6 +185,19 @@ save_image = transforms.SaveImage(os.path.join(base_path, "data"), output_ext=".
 def save_to_nii(img, meta_dict): return save_image(img, meta_dict)
 
 import csv
+import wandb
+
+project, entity = load_wand_credentials()
+wandb_run = wandb.init(project=project, entity=entity, name=WANDB_RUN_NAME, 
+           config={"run_config": run_config,
+                   "auto_encoder_config": auto_encoder_config, 
+                   "patch_discrim_config": patch_discrim_config,
+                   "auto_encoder_training_config": auto_encoder_training_config,
+                   "diffusion_model_unet_config": diffusion_model_unet_config,
+                   "diffusion_model_training_config": diffusion_model_training_config,
+                   })
+
+from src.util import log_image_with_mask
 
 with open(os.path.join(base_path, AbnormalSyntheticMaskDataset.OVERVIEW_FILENAME), mode='w', newline='') as overview_file:
     writer = csv.writer(overview_file, delimiter='\t', lineterminator='\n')
@@ -160,9 +205,15 @@ with open(os.path.join(base_path, AbnormalSyntheticMaskDataset.OVERVIEW_FILENAME
 
     for i, batch in tqdm(enumerate(volume_dataloader), total=len(volume_dataloader), desc="Synthesis"):
         mask = decode_one_hot(evaluator.get_synthetic_output(batch, False)).to(torch.int8)
-        for batch_i in range(batch_size):
+        image = torch.zeros_like(mask).detach().cpu().numpy()
+        to_log = mask.detach().cpu().numpy()
 
+        for batch_i in range(batch_size):
             volume = batch["volume"][batch_i, :, 0].detach().cpu().item()
+
+            log_image_with_mask(image[batch_i, 0], to_log[batch_i, 0], image[batch_i, 0], to_log[batch_i, 0], "diffusion/evaluation", batch["volume"][batch_i, :, 0].detach().cpu())
+
+
             sub_path = f"{i * batch_size + batch_i}"
 
             meta_dict = {"input_image_name": sub_path}

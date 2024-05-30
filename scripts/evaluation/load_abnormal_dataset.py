@@ -58,8 +58,6 @@ wandb_run = wandb.init(project=project, entity=entity, name=WANDB_RUN_NAME,
                    "diffusion_model_training_config": diffusion_model_training_config,
                    })
 
-run_config["input_image_downsampling_factors"]=[1.2, 1.07, 1.2]
-
 # for reproducibility purposes set a seed
 set_determinism(42)
 
@@ -69,6 +67,7 @@ LOGGER.info(f"Using classifier free guidance: {CLASSIFIER_FREE_GUIDANCE}")
 down_sampling_factor = (2 ** (len(auto_encoder_config["num_channels"]) -1) )
 image_shape = (run_config["batch_size"], 1, run_config["input_image_crop_roi"][0], run_config["input_image_crop_roi"][1], run_config["input_image_crop_roi"][2])
 LOGGER.info(f"Image shape: {image_shape}")
+
 dim_xyz = tuple(map(lambda x: x // down_sampling_factor, run_config["input_image_crop_roi"]))
 encoding_shape = (run_config["batch_size"], auto_encoder_config["latent_channels"], dim_xyz[0], dim_xyz[1], dim_xyz[2])
 LOGGER.info(f"Encoding shape: {encoding_shape}")
@@ -101,7 +100,7 @@ inferer = LatentDiffusionInferer(scheduler, scale_factor=scale_factor)
 from monai import transforms
 
 def peek(mask):
-    print(mask.shape)
+    print(f"Actual size: {mask.shape}, expected: {run_config['input_image_crop_roi']}")
     return mask
 
 
@@ -112,8 +111,9 @@ train_transforms = transforms.Compose(
         transforms.EnsureChannelFirstd(keys=["mask"]),
         transforms.EnsureTyped(keys=["mask"]),
         #transforms.Orientationd(keys=["mask", "image"], axcodes="IPL"), # axcodes="RAS"
-        transforms.Spacingd(keys=["mask"], pixdim=run_config["input_image_downsampling_factors"], mode=("nearest")),
+        #transforms.Spacingd(keys=["mask"], pixdim=run_config["input_image_downsampling_factors"], mode=("nearest")),
         transforms.CenterSpatialCropd(keys=["mask"], roi_size=run_config["input_image_crop_roi"]),
+        transforms.Lambdad(keys=["mask"], func=peek),
         transforms.Lambdad(keys=["volume"], func = lambda x: torch.tensor(x, dtype=torch.float32).unsqueeze(0).unsqueeze(0)),
     ]
 )
@@ -123,14 +123,16 @@ dataset = AbnormalSyntheticMaskDataset(
     dataset_path=os.path.join(DATA_DIRECTORY, "abnormal_masks"),
     section="training",
     val_frac=0.0,
-    size=8,
+    test_frac=0.0,
+    size=20,
     cache_rate=1.0,  # you may need a few Gb of RAM... Set to 0 otherwise
     num_workers=2,
     seed=0,
     transform=train_transforms,
 )
 
-train_loader = DataLoader(dataset, batch_size=run_config["batch_size"], shuffle=True, num_workers=2, persistent_workers=True, drop_last=True)
+train_loader = DataLoader(dataset, batch_size=run_config["batch_size"], shuffle=True, num_workers=2, persistent_workers=True, drop_last=False)
+print(len(train_loader))
 
 LOGGER.info(f"mask shape: {iter(train_loader).__next__()['mask'].shape}")
 
@@ -147,6 +149,21 @@ evaluator = SpadeDiffusionModelEvaluator(
                  evaluation_scheduler=evaluation_scheduler,
                  guidance=CLASSIFIER_FREE_GUIDANCE
                  )
-evaluator.log_samples(8, False)
+#evaluator.log_samples(16, False)
+
+batch_size = run_config["batch_size"]
+
+from src.util import visualize_3d_image_slice_wise
+from src.directory_management import OUTPUT_DIRECTORY
+
+for j, batch in enumerate(train_loader):
+    images = evaluator.image_preprocessing(evaluator.get_synthetic_output(batch, False))
+    for i in range(batch_size):
+        img = images[i, 0].detach().cpu()
+        mask = batch["mask"][i, 0].int().detach().cpu()
+        condition = batch["volume"][i, 0]
+        visualize_3d_image_slice_wise(img, OUTPUT_DIRECTORY + f"/{j * batch_size + i:03d}_img.png", description_prefix="", log_to_wandb=False, conditioning_information=condition)
+        visualize_3d_image_slice_wise(mask, OUTPUT_DIRECTORY + f"/{j * batch_size + i:03d}_mask.png", description_prefix="", log_to_wandb=False, conditioning_information=condition,
+                                      is_image_mask=True)
 
 
