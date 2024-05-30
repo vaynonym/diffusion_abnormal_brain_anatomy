@@ -1,0 +1,8 @@
+run:
+  batch_size: 1
+  target_spacing: [1.667, 1.75, 1.667] # [2, 2, 2]  # (160, 224, 160) ==>
+  input_image_crop_roi: [96,128,96] # [80,112,80]  
+  evaluation_intervall: 0.33
+  dataset: "RH_FLAIR"
+  dataset_size: 100
+  oversample_large_ventricles: False
