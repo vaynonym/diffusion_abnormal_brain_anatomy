@@ -95,6 +95,8 @@ synthseg_class_to_string_map = {
 60:        "right ventral DC",
 }
 
+brain_stem_indices = torch.Tensor([16]).to(device)
+
 central_areas_close_to_ventricles = [
     "left thalamus",
     "left caudate",
@@ -170,6 +172,16 @@ def encode_one_hot(mask: torch.Tensor, device=device):
     
     return one_hot
 
+def encode_contiguous_labels_one_hot(mask: torch.Tensor, device=device):
+    assert len(mask.shape) == 5
+    shp = list(mask.shape)
+    shp[1] = len(synthseg_classes)
+    one_hot = torch.zeros(shp).to(device)
+    for channel in range(len(synthseg_classes)):
+        one_hot[:, channel, ...] = mask[:, 0, ...] == channel
+    
+    return one_hot
+
 # decodes to actual synthseg values
 def decode_one_hot(mask: torch.Tensor, device=device):
     # [B, C, SPATIALS]
@@ -182,5 +194,9 @@ def decode_one_hot(mask: torch.Tensor, device=device):
     index = torch.bucketize(unhotted.ravel(), base)
 
     return (classes[index].reshape(unhotted.shape)).to(torch.int32)
+
+def decode_one_hot_to_consecutive_indices(mask: torch.Tensor, device=device):
+    assert len(list(mask.shape)) == 5
+    return mask.argmax(1, keepdim=True)
 
 
